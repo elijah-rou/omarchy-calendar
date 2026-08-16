@@ -77,6 +77,9 @@ elif "printcalendars" in args:
     print("local")
     print("work")
 elif "list" in args:
+    if os.environ.get("HUGE_OUTPUT") == "1":
+        print("x" * (2 * 1024 * 1024))
+        raise SystemExit(0)
     print("[]")
     print(json.dumps([{"uid":"one","title":"Standup","start":"2030-01-02 10:00","end":"2030-01-02 10:30","calendar":"work","all-day":"False"}]))
     print("[]")
@@ -138,6 +141,24 @@ class BackendProtocolTests(IsolatedEnvironment):
         self.assertIn('"--include-calendar", "work"', log)
         self.assertNotIn("shell=True", log)
 
+    def test_qml_create_contract_uses_calendar_id_and_minute_times(self) -> None:
+        response = self.run_backend({
+            "action": "create",
+            "requestId": "qml-create",
+            "calendarId": "local",
+            "title": "Planning",
+            "start": "2030-01-03T09:00",
+            "end": "2030-01-03T10:00",
+            "allDay": False,
+            "sync": False,
+        })
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["requestId"], "qml-create")
+        self.assertEqual(response["event"]["calendarId"], "local")
+        lines = Path(self.env["COMMAND_LOG"]).read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("khal "))
+
     def test_create_is_saved_before_failed_sync(self) -> None:
         config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
         (config / "vdirsyncer.conf").write_text("test", encoding="utf-8")
@@ -175,12 +196,28 @@ class BackendProtocolTests(IsolatedEnvironment):
         self.assertEqual(status["versions"]["vdirsyncer"], "vdirsyncer, version 0.20.0")
 
     def test_rejects_unknown_fields_ranges_and_oversize_input(self) -> None:
-        unknown = self.run_backend({"action": "status", "extra": True})
+        unknown = self.run_backend({"action": "status", "requestId": "error-id", "extra": True})
         self.assertEqual(unknown["error"]["code"], "invalid_request")
+        self.assertEqual(unknown["requestId"], "error-id")
+        one_day = self.run_backend({"action": "list", "start": "2030-01-01", "end": "2030-01-01"})
+        self.assertTrue(one_day["ok"])
         wide = self.run_backend({"action": "list", "start": "2030-01-01", "end": "2032-01-01"})
         self.assertEqual(wide["error"]["code"], "invalid_request")
         oversize = self.run_backend({}, raw=b"{" + b" " * (64 * 1024))
         self.assertEqual(oversize["error"]["code"], "request_too_large")
+
+    def test_command_output_is_bounded(self) -> None:
+        self.env["HUGE_OUTPUT"] = "1"
+        response = self.run_backend({
+            "action": "list",
+            "requestId": "huge",
+            "start": "2030-01-01",
+            "end": "2030-01-02",
+        })
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["requestId"], "huge")
+        self.assertEqual(response["error"]["code"], "command_failed")
+        self.assertIn("output exceeded", response["error"]["message"])
 
     def test_rejects_invalid_values_before_invoking_commands(self) -> None:
         response = self.run_backend(
@@ -271,6 +308,29 @@ class SetupTests(IsolatedEnvironment):
         self.assertIn("discover", lines[0])
         self.assertIn("sync", lines[1])
 
+    def test_failed_remote_setup_preserves_active_configuration(self) -> None:
+        self.write_command("vdirsyncer", FAKE_VDIRSYNCER)
+        self.run_setup(
+            "caldav", "--url", "https://working.test/", "--username", "me",
+            "--password-command", "secret-tool", "--configure-only",
+        )
+        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
+        before = config.read_text()
+        self.env["FAIL_SYNC"] = "1"
+        result = subprocess.run(
+            [
+                str(SETUP), "caldav", "--url", "https://broken.test/", "--username", "me",
+                "--password-command", "secret-tool",
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=10,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(config.read_text(), before)
+
     @unittest.skipUnless(shutil.which("vdirsyncer"), "vdirsyncer is not installed")
     def test_generated_caldav_config_loads_with_vdirsyncer_020(self) -> None:
         executable = shutil.which("vdirsyncer")
@@ -325,9 +385,16 @@ class Khal014CompatibilityTests(IsolatedEnvironment):
         created = self.run_backend(
             {"action": "create", "title": "Compatibility", "start": "2030-04-05T10:00", "end": "2030-04-05T10:30", "sync": False}
         )
+        end_date = self.run_backend(
+            {"action": "create", "title": "Inclusive end", "start": "2030-04-06T10:00", "end": "2030-04-06T10:30", "sync": False}
+        )
         self.assertTrue(created["ok"], created)
+        self.assertTrue(end_date["ok"], end_date)
         listed = self.run_backend({"action": "list", "start": "2030-04-05", "end": "2030-04-06"})
-        self.assertEqual([event["title"] for event in listed["events"]], ["Compatibility"])
+        self.assertEqual(
+            [event["title"] for event in listed["events"]],
+            ["Compatibility", "Inclusive end"],
+        )
 
     def run_setup_local(self) -> None:
         subprocess.run([str(SETUP), "local"], env=self.env, stdout=subprocess.PIPE, check=True, timeout=10)

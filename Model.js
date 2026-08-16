@@ -441,9 +441,10 @@ function validateCreateInput(input) {
     value: {
       calendarId: calendarId,
       title: title,
-      start: date + "T" + start + ":00",
-      end: date + "T" + end + ":00",
-      allDay: false
+      start: date + "T" + start,
+      end: date + "T" + end,
+      allDay: false,
+      sync: false
     }
   }
 }

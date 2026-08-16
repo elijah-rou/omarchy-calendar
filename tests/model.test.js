@@ -62,7 +62,7 @@ function testCreateValidation() {
     error: '',
     value: {
       calendarId: 'work', title: 'Planning',
-      start: '2026-08-19T09:05:00', end: '2026-08-19T10:30:00', allDay: false
+      start: '2026-08-19T09:05', end: '2026-08-19T10:30', allDay: false, sync: false
     }
   })
 

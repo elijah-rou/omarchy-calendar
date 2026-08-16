@@ -47,7 +47,7 @@ Panel {
   property var activeRequest: null
   property string latestListRequestId: ""
   property string latestCalendarsRequestId: ""
-  readonly property int maxResponseBytes: 262144
+  readonly property int maxResponseBytes: 1048576
   readonly property int maxQueuedRequests: 8
   readonly property string helperPath: Model.localPathForUrl(Qt.resolvedUrl("bin/omarchy-calendar"))
 
@@ -109,14 +109,13 @@ Panel {
     if (!root.weeks || root.weeks.length !== 6) return
     var first = root.weeks[0].days[0].key
     var lastCell = root.weeks[5].days[6]
-    var endDate = new Date(lastCell.year, lastCell.month, lastCell.day + 1)
     root.listLoading = true
     root.listError = ""
     root.events = []
     root.latestListRequestId = root.enqueueRequest({
       action: "list",
       start: first,
-      end: Model.keyForDate(endDate)
+      end: lastCell.key
     })
   }
 
@@ -187,15 +186,19 @@ Panel {
       root.startNextRequest()
       return
     }
-    if (!response || typeof response !== "object" || Array.isArray(response)
-        || String(response.requestId || "") !== String(request.requestId)) {
-      root.failAction(action, "Calendar response did not match its request")
+    if (!response || typeof response !== "object" || Array.isArray(response)) {
+      root.failAction(action, "Calendar helper returned an invalid response")
       root.startNextRequest()
       return
     }
     if (response.ok === false || response.error) {
       var message = response.error && response.error.message ? response.error.message : response.error
       root.failAction(action, String(message || "Calendar request failed"))
+      root.startNextRequest()
+      return
+    }
+    if (String(response.requestId || "") !== String(request.requestId)) {
+      root.failAction(action, "Calendar response did not match its request")
       root.startNextRequest()
       return
     }
@@ -316,6 +319,7 @@ Panel {
   }
 
   function cancelAdd() {
+    if (root.createLoading) return
     root.addingEvent = false
     root.createLoading = false
     root.formError = ""
@@ -377,7 +381,7 @@ Panel {
 
   Timer {
     id: requestTimeout
-    interval: 15000
+    interval: root.activeRequest && (root.activeRequest.action === "list" || root.activeRequest.action === "create") ? 45000 : 15000
     repeat: false
     onTriggered: {
       if (!requestProcess.running) return
@@ -389,7 +393,7 @@ Panel {
 
   Timer {
     id: requestHardKill
-    interval: 500
+    interval: 1500
     repeat: false
     onTriggered: if (requestProcess.running) requestProcess.signal(9)
   }

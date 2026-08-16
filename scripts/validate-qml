@@ -11,4 +11,12 @@ node --check tests/model.test.js
 qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml Panel.qml
 qmllint Model.js
 
+# Qt's standalone parser does not understand Quickshell's typed IPC methods.
+# Strip only the `: void` return annotation in a same-directory lint copy so
+# relative imports still resolve and the rest of the shipped entry point parses.
+lint_entry="$root/.BarWidget.lint.qml"
+trap 'rm -f "$lint_entry"' EXIT
+sed -E 's/(function [A-Za-z0-9_]+\(\)): void/\1/' BarWidget.qml >"$lint_entry"
+qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml "$lint_entry"
+
 printf 'QML validation passed\n'

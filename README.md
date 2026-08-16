@@ -116,7 +116,8 @@ successful response. Unknown fields and incorrectly typed values are rejected.
 
 Returns `{"ok":true,"events":[...]}`. Event objects use `calendarId`,
 `calendarName`, ISO local `start`/`end`, and `allDay`. Dates use `YYYY-MM-DD`;
-`end` must be after `start`. Omit `calendars` to include all calendars.
+`start` and `end` are inclusive and may be the same day. Omit `calendars` to
+include all calendars.
 
 ### Create an event
 
@@ -129,8 +130,10 @@ Timed values use local `YYYY-MM-DDTHH:MM`. For all-day events, set `allDay` to
 `description` are optional. `sync` defaults to `true`; set it to `false` when a
 caller is batching writes.
 
-khal commits the event to the local vdir before vdirsyncer runs. A remote sync
-failure is returned in the successful create response under `sync` and recorded
+The panel creates locally with `sync: false`; the user timer performs the next
+remote synchronization without blocking the UI. Other callers may request an
+immediate sync. khal commits the event to the local vdir before vdirsyncer runs.
+A remote sync failure is returned in the successful create response under `sync` and recorded
 in `$XDG_STATE_HOME/omarchy-calendar/sync-status.json`; it does not discard or
 misreport the local creation.
 

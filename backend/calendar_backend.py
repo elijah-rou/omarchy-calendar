@@ -6,15 +6,19 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import selectors
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_STDERR_BYTES = 64 * 1024
 MAX_EVENTS = 256
 MAX_RANGE_DAYS = 366
 COMMAND_TIMEOUT_SECONDS = 30
@@ -132,27 +136,68 @@ def command_argv(executable: str, *arguments: str) -> list[str]:
     return [resolved, *arguments]
 
 
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=1)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=1)
+
+
 def run_command(argv: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     assert argv
     assert timeout > 0
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=os.environ.copy(),
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as error:
-        raise CommandError(Path(argv[0]).name, f"command timed out after {timeout} seconds") from error
     except OSError as error:
         raise CommandError(Path(argv[0]).name, str(error)) from error
-    if len(result.stdout.encode("utf-8")) > MAX_RESPONSE_BYTES:
-        raise CommandError(Path(argv[0]).name, "command output exceeded the response limit")
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    streams = selectors.DefaultSelector()
+    streams.register(process.stdout, selectors.EVENT_READ, (stdout_buffer, MAX_RESPONSE_BYTES))
+    streams.register(process.stderr, selectors.EVENT_READ, (stderr_buffer, MAX_STDERR_BYTES))
+    deadline = time.monotonic() + timeout
+    try:
+        while streams.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_process_group(process)
+                raise CommandError(Path(argv[0]).name, f"command timed out after {timeout} seconds")
+            for key, _events in streams.select(min(remaining, 0.25)):
+                buffer, limit = key.data
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    streams.unregister(key.fileobj)
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) > limit:
+                    terminate_process_group(process)
+                    raise CommandError(Path(argv[0]).name, "command output exceeded its limit")
+        returncode = process.wait(timeout=1)
+    finally:
+        streams.close()
+        if process.poll() is None:
+            terminate_process_group(process)
+
+    stdout = stdout_buffer.decode("utf-8", errors="replace")
+    stderr = stderr_buffer.decode("utf-8", errors="replace")
+    result = subprocess.CompletedProcess(argv, returncode, stdout, stderr)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
         raise CommandError(Path(argv[0]).name, detail[:2048])
@@ -236,9 +281,9 @@ def request_list(request: dict[str, Any]) -> dict[str, Any]:
     assert end_text is not None
     start = parse_date(start_text, "start")
     end = parse_date(end_text, "end")
-    days = (end - start).days
+    days = (end - start).days + 1
     if days <= 0 or days > MAX_RANGE_DAYS:
-        raise ProtocolError("invalid_request", f"date range must be 1 to {MAX_RANGE_DAYS} days")
+        raise ProtocolError("invalid_request", f"inclusive date range must be 1 to {MAX_RANGE_DAYS} days")
 
     calendars = request.get("calendars", [])
     if not isinstance(calendars, list) or len(calendars) > 32:
@@ -433,14 +478,19 @@ def emit(response: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    request: dict[str, Any] = {}
     try:
-        response = dispatch(read_request())
+        request = read_request()
+        response = dispatch(request)
     except ProtocolError as error:
         response = {"ok": False, "error": {"code": error.code, "message": error.message}}
     except CommandError as error:
         response = {"ok": False, "error": {"code": "command_failed", "message": error.message, "command": error.command}}
     except Exception:  # noqa: BLE001 - stdout must remain valid protocol on every failure.
         response = {"ok": False, "error": {"code": "internal_error", "message": "unexpected backend failure"}}
+    request_id = request.get("requestId")
+    if isinstance(request_id, str) and len(request_id.encode("utf-8")) <= 128:
+        response.setdefault("requestId", request_id)
     emit(response)
     return 0
 

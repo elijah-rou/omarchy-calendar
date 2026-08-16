@@ -7,9 +7,8 @@ import "Model.js" as Model
 
 // Date/time label for the bar, and the host for the calendar popup.
 //
-// Left click reveals the calendar — asking "what is the date?" is what a
-// click on a clock means — right click walks the common label formats, and
-// middle click opens the timezone picker.
+// Left click toggles the calendar, right click refreshes and opens it without
+// mutating the configured format, and middle click opens the timezone picker.
 BarWidget {
   id: root
   moduleName: "elijahrou.calendar"

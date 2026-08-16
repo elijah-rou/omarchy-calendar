@@ -155,12 +155,22 @@ def run(argv: list[str], timeout: int = TIMEOUT_SECONDS) -> None:
 
 
 def configure_remote(remote_block: str, configure_only: bool) -> None:
-    paths = bootstrap(remote=True)
+    paths = bootstrap(remote=False)
     config_path = paths["config"] / "vdirsyncer.conf"
-    atomic_write(config_path, vdirsyncer_config(paths, remote_block), 0o600)
-    if not configure_only:
-        run(["vdirsyncer", "-c", str(config_path), "discover"])
-        run(["vdirsyncer", "-c", str(config_path), "sync"])
+    descriptor, candidate_name = tempfile.mkstemp(prefix=".vdirsyncer-candidate-", dir=paths["config"])
+    os.close(descriptor)
+    candidate_path = Path(candidate_name)
+    candidate_path.unlink()
+    atomic_write(candidate_path, vdirsyncer_config(paths, remote_block), 0o600)
+    try:
+        if not configure_only:
+            run(["vdirsyncer", "-c", str(candidate_path), "discover"])
+            run(["vdirsyncer", "-c", str(candidate_path), "sync"])
+        os.replace(candidate_path, config_path)
+        atomic_write(paths["config"] / "khal.conf", khal_config(paths, True), 0o600)
+    except BaseException:
+        candidate_path.unlink(missing_ok=True)
+        raise
     print(f"configured calendar data in {paths['data']}")
     print(f"configuration: {paths['config']}")
 
