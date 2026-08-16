@@ -1,103 +1,73 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// The clock's calendar popup: a month grid with ISO week numbers, built to
-// sit beside the weather panel — same hero-over-detail composition, same
-// spacing scale, same small-caps labels.
-//
-// The grid is a read-out rather than a picker: today is the only marked
-// day, and the only thing that moves is which month is on screen —
-// chevrons, the scroll wheel, and the arrow keys all step it.
-//
-// BarWidget.qml owns the bar label and hands this panel the button to
-// anchor against.
+// Itsycal-style calendar popout. BarWidget.qml remains the visible clock and
+// this nested panel keeps the stock open/close/owner contracts used by the bar.
 Panel {
   id: root
-  moduleName: "omarchy.clock"
-  ipcTarget: "omarchy.clock"
+  moduleName: "elijahrou.calendar"
+  ipcTarget: "elijahrou.calendar"
   manageIpc: false
 
   property var anchorItem: null
-
-  // The bar tracks the widget mounted in its slot — BarWidget.qml — not this
-  // nested panel. Everything the bar identifies a panel by has to be that
-  // widget: the popout coordinator (and with it the open-panel dot under the
-  // pill) compares against `slot.activeItem`, and switchPanelFrom looks the
-  // slot up the same way.
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  // ---- Today. SystemClock keeps this honest across midnight so the
-  //      highlight rolls over without the panel being reopened.
   property date today: new Date()
-  readonly property string todayKey: Model.keyForDate(today)
-
-  // The month on screen. Stepping moves this and nothing else: the grid is
-  // a read-out, not a picker, so there is no per-day cursor to keep in sync.
   property int viewYear: today.getFullYear()
   property int viewMonth: today.getMonth()
-
+  property string selectedKey: Model.keyForDate(today)
+  readonly property string todayKey: Model.keyForDate(today)
   readonly property date viewDate: new Date(viewYear, viewMonth, 1)
-  readonly property bool viewingCurrentMonth: viewYear === today.getFullYear() && viewMonth === today.getMonth()
-
-  // Pinned to today, not to the month being browsed — stepping through the
-  // calendar does not change how much of the year is gone.
-  readonly property real yearDone: Model.yearProgress(today.getFullYear(), today.getMonth(), today.getDate())
-  readonly property int yearDonePercent: Model.yearProgressPercent(today.getFullYear(), today.getMonth(), today.getDate())
-
-  // Memento mori, for anyone who goes looking: double-tapping the year bar
-  // asks for a birth year and a life expectancy, and a second bar tracks one
-  // against the other. A birth year rather than an age, so it keeps counting
-  // on its own. Without one the bar stays hidden.
-  readonly property int birthYear: Model.parseBirthYear(setting("birthYear", 0), today.getFullYear())
-  readonly property int age: Model.ageFromBirthYear(birthYear, today.getFullYear())
-  readonly property int lifeExpectancy: Model.parseLifeExpectancy(setting("lifeExpectancy", 0))
-  readonly property real lifeDone: Model.lifeProgress(age, lifeExpectancy)
-  readonly property int lifeDonePercent: Model.lifeProgressPercent(age, lifeExpectancy)
-  property bool editingLife: false
-
-  // Unset falls through to the locale's own first day, so a fresh install
-  // starts out matching the rest of the desktop rather than a hardcoded
-  // convention. Clicking the grid's "W" heading writes the choice back to
-  // shell.json.
   readonly property int weekStart: Model.normalizedWeekStart(setting("weekStartDay", null), Qt.locale().firstDayOfWeek)
-  readonly property string nextWeekStartLabel: Qt.locale().dayName(Model.toggledWeekStart(weekStart), Locale.LongFormat)
   readonly property var weekdays: Model.weekdayOrder(weekStart)
   readonly property var weeks: Model.monthGrid(viewYear, viewMonth, weekStart, todayKey)
 
+  property var events: []
+  readonly property var eventsByDate: Model.mapEventsByDate(events)
+  readonly property var agendaEvents: Model.upcomingEvents(events, selectedKey, 8)
+  property var calendars: []
+  readonly property var calendarOptions: calendarOptionsFor(calendars)
 
-  // Guarded so the widget renders before the bar is injected (the bar-widget
-  // contract instantiates it bare).
+  property bool listLoading: false
+  property bool calendarsLoading: false
+  property bool createLoading: false
+  property string listError: ""
+  property string calendarError: ""
+  property string backendStatus: ""
+  property bool addingEvent: false
+  property string formError: ""
+
+  property int requestSequence: 0
+  property var requestQueue: []
+  property var activeRequest: null
+  property string latestListRequestId: ""
+  property string latestCalendarsRequestId: ""
+  readonly property int maxResponseBytes: 262144
+  readonly property int maxQueuedRequests: 8
+  readonly property string helperPath: Model.localPathForUrl(Qt.resolvedUrl("bin/omarchy-calendar"))
+
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
-
-  readonly property int cellWidth: Style.space(52)
-  readonly property int cellHeight: Style.space(34)
+  readonly property int cellWidth: Style.space(51)
+  readonly property int cellHeight: Style.space(38)
   readonly property int cellSpacing: Style.space(2)
-  readonly property int weekColumnWidth: Style.space(32)
-  readonly property int gutterWidth: Style.space(14)
 
   function open() {
     refresh()
     root.controller.show()
-    // Set after showing, not before: showing hands the popout coordinator
-    // over, which closes whichever panel was open, and that close clears the
-    // shared flag. Deferring means the panel taking over always wins, while
-    // a handoff to a panel that does not manage the flag still leaves it
-    // cleared rather than stuck on.
     Qt.callLater(function() {
-      if (root.opened) setCenterHoverRevealSuppressed(true)
+      if (root.opened) root.setCenterHoverRevealSuppressed(true)
     })
   }
 
   function close() {
-    setCenterHoverRevealSuppressed(false)
-    // Dismissing the panel mid-edit would otherwise leave the inputs up,
-    // waiting behind a closed popup for the next time it opens.
-    if (root.editingLife) root.cancelEditingLife()
+    root.setCenterHoverRevealSuppressed(false)
+    root.cancelAdd()
     root.controller.hide()
   }
 
@@ -112,8 +82,6 @@ Panel {
     return false
   }
 
-  // Summoning by hotkey moves no pointer, so a hover the bar was still
-  // holding must not keep the center indicators revealed behind the panel.
   function setCenterHoverRevealSuppressed(value) {
     if (root.bar && "centerHoverRevealSuppressed" in root.bar)
       root.bar.centerHoverRevealSuppressed = value
@@ -121,112 +89,317 @@ Panel {
 
   function refresh() {
     root.today = new Date()
-    root.goToToday()
+    root.viewYear = root.today.getFullYear()
+    root.viewMonth = root.today.getMonth()
+    root.selectedKey = Model.keyForDate(root.today)
+    root.refreshData(true)
   }
 
-  function goToToday() {
-    root.viewYear = today.getFullYear()
-    root.viewMonth = today.getMonth()
+  function refreshData(includeMetadata) {
+    root.requestEventRange()
+    if (includeMetadata || root.calendars.length === 0) {
+      root.calendarsLoading = true
+      root.calendarError = ""
+      root.latestCalendarsRequestId = root.enqueueRequest({ action: "calendars" })
+      root.enqueueRequest({ action: "status" })
+    }
+  }
+
+  function requestEventRange() {
+    if (!root.weeks || root.weeks.length !== 6) return
+    var first = root.weeks[0].days[0].key
+    var lastCell = root.weeks[5].days[6]
+    var endDate = new Date(lastCell.year, lastCell.month, lastCell.day + 1)
+    root.listLoading = true
+    root.listError = ""
+    root.events = []
+    root.latestListRequestId = root.enqueueRequest({
+      action: "list",
+      start: first,
+      end: Model.keyForDate(endDate)
+    })
+  }
+
+  function enqueueRequest(request) {
+    if (root.helperPath === "") {
+      root.failAction(String(request.action || ""), "Calendar helper path is unavailable")
+      return ""
+    }
+    if (root.requestQueue.length >= root.maxQueuedRequests) {
+      root.failAction(String(request.action || ""), "Too many calendar requests")
+      return ""
+    }
+    root.requestSequence++
+    var copy = {}
+    for (var key in request) copy[key] = request[key]
+    copy.requestId = "qml-" + root.requestSequence
+    var next = root.requestQueue.slice()
+    next.push(copy)
+    root.requestQueue = next
+    root.startNextRequest()
+    return copy.requestId
+  }
+
+  function startNextRequest() {
+    if (requestProcess.running || root.activeRequest || root.requestQueue.length === 0) return
+    var queue = root.requestQueue.slice()
+    root.activeRequest = queue.shift()
+    root.requestQueue = queue
+    requestProcess.responseText = ""
+    requestProcess.errorText = ""
+    requestProcess.timedOut = false
+    requestProcess.command = [root.helperPath, "request"]
+    requestProcess.running = true
+  }
+
+  function finishRequest(exitCode) {
+    requestTimeout.stop()
+    requestHardKill.stop()
+    var request = root.activeRequest
+    root.activeRequest = null
+    if (!request) {
+      root.startNextRequest()
+      return
+    }
+    var action = String(request.action || "")
+    if (requestProcess.timedOut) {
+      root.failAction(action, "Calendar request timed out")
+      root.startNextRequest()
+      return
+    }
+    var output = String(requestProcess.responseText || "")
+    if (output.length > root.maxResponseBytes) {
+      root.failAction(action, "Calendar response was too large")
+      root.startNextRequest()
+      return
+    }
+    if (exitCode !== 0) {
+      var stderr = String(requestProcess.errorText || "").trim()
+      root.failAction(action, stderr || "Calendar helper failed")
+      root.startNextRequest()
+      return
+    }
+
+    var response = null
+    try { response = JSON.parse(output) }
+    catch (error) {
+      root.failAction(action, "Calendar helper returned invalid JSON")
+      root.startNextRequest()
+      return
+    }
+    if (!response || typeof response !== "object" || Array.isArray(response)
+        || String(response.requestId || "") !== String(request.requestId)) {
+      root.failAction(action, "Calendar response did not match its request")
+      root.startNextRequest()
+      return
+    }
+    if (response.ok === false || response.error) {
+      var message = response.error && response.error.message ? response.error.message : response.error
+      root.failAction(action, String(message || "Calendar request failed"))
+      root.startNextRequest()
+      return
+    }
+    var body = response.result !== undefined ? response.result
+      : (response.data !== undefined ? response.data : response)
+    root.applyResponse(action, request.requestId, body)
+    root.startNextRequest()
+  }
+
+  function failAction(action, message) {
+    if (action === "list") {
+      root.listLoading = false
+      root.listError = message
+    } else if (action === "calendars") {
+      root.calendarsLoading = false
+      root.calendarError = message
+    } else if (action === "create") {
+      root.createLoading = false
+      root.formError = message
+    } else if (action === "status") {
+      root.backendStatus = message
+    }
+  }
+
+  function applyResponse(action, requestId, body) {
+    if (action === "list") {
+      if (requestId !== root.latestListRequestId) return
+      var rawEvents = Array.isArray(body) ? body : (body && Array.isArray(body.events) ? body.events : [])
+      root.events = Model.normalizeEvents(rawEvents)
+      root.listLoading = false
+      root.listError = ""
+    } else if (action === "calendars") {
+      if (requestId !== root.latestCalendarsRequestId) return
+      var rawCalendars = Array.isArray(body) ? body : (body && Array.isArray(body.calendars) ? body.calendars : [])
+      var clean = []
+      for (var i = 0; i < rawCalendars.length && clean.length < 100; i++) {
+        var calendar = rawCalendars[i]
+        if (!calendar || typeof calendar !== "object") continue
+        var id = String(calendar.id || calendar.calendarId || "").trim()
+        var name = String(calendar.name || calendar.calendarName || id).trim()
+        if (id !== "") clean.push({ id: id.substr(0, 200), name: name.substr(0, 200) })
+      }
+      root.calendars = clean
+      root.calendarsLoading = false
+      root.calendarError = clean.length === 0 ? "No writable calendars" : ""
+    } else if (action === "status") {
+      if (body && (body.configured === false || body.ready === false))
+        root.backendStatus = String(body.message || "Calendar setup is required")
+      else root.backendStatus = body && body.error ? String(body.error) : ""
+    } else if (action === "create") {
+      root.createLoading = false
+      root.addingEvent = false
+      root.formError = ""
+      root.requestEventRange()
+    }
+  }
+
+  function calendarOptionsFor(values) {
+    var options = []
+    for (var i = 0; i < values.length; i++) options.push({ value: values[i].id, label: values[i].name })
+    return options
   }
 
   function moveMonth(delta) {
-    var next = Model.stepMonth(viewYear, viewMonth, delta)
+    var next = Model.stepMonth(root.viewYear, root.viewMonth, delta)
     root.viewYear = next.year
     root.viewMonth = next.month
+    root.selectedKey = Model.dateKey(next.year, next.month, 1)
+    root.requestEventRange()
   }
 
-  function moveYear(delta) {
-    moveMonth(delta * 12)
+  function selectDay(day) {
+    root.selectedKey = day.key
+    if (!day.inMonth) {
+      root.viewYear = day.year
+      root.viewMonth = day.month
+      root.requestEventRange()
+    }
   }
 
-  // Applied locally first so the panel redraws on the click itself; the
-  // shell.json write comes back through the bar as the same value. With no
-  // writable entry (the widget is not in the layout) it stays a session-only
-  // preference rather than doing nothing. The host widget builds its own
-  // entry when the label format is cycled, so it has to be kept in step or
-  // it would write this key straight back out from a stale copy.
-  function persistSettings(values) {
+  function moveSelection(days) {
+    var parts = root.selectedKey.split("-")
+    if (parts.length !== 3) return
+    var date = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]) + days)
+    var monthChanged = date.getFullYear() !== root.viewYear || date.getMonth() !== root.viewMonth
+    root.selectedKey = Model.keyForDate(date)
+    if (monthChanged) {
+      root.viewYear = date.getFullYear()
+      root.viewMonth = date.getMonth()
+      root.requestEventRange()
+    }
+  }
+
+  function toggleWeekStart() {
+    var next = Model.toggledWeekStart(root.weekStart)
     var entry = { id: root.moduleName }
-    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
-    for (var key in values) entry[key] = values[key]
-
+    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
+    entry.weekStartDay = Model.weekStartSettingName(next)
     root.settings = entry
     if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry
     if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
       root.bar.shell.updateEntryInline(root.moduleName, entry)
   }
 
-  function setWeekStart(day) {
-    var next = Model.normalizedWeekStart(day, root.weekStart)
-    if (next === root.weekStart) return
-    persistSettings({ weekStartDay: Model.weekStartSettingName(next) })
+  function weekdayLabel(day) {
+    return String(Qt.locale().dayName(day, Locale.ShortFormat)).replace(/\.$/, "").toUpperCase()
   }
 
-  function startEditingLife() {
-    root.editingLife = true
-    Qt.callLater(function() {
-      bornField.text = root.birthYear > 0 ? String(root.birthYear) : ""
-      expectancyField.text = String(root.lifeExpectancy)
-      bornField.selectAll()
-      bornField.forceActiveFocus()
-    })
+  function startAdd() {
+    root.addingEvent = true
+    root.formError = ""
+    eventCalendar.value = root.calendars.length > 0 ? root.calendars[0].id : ""
+    eventTitle.text = ""
+    eventDate.text = root.selectedKey
+    eventStart.text = "09:00"
+    eventEnd.text = "10:00"
+    Qt.callLater(function() { eventTitle.forceActiveFocus() })
   }
 
-  function cancelEditingLife() {
-    root.editingLife = false
+  function cancelAdd() {
+    root.addingEvent = false
+    root.createLoading = false
+    root.formError = ""
+    if (eventCalendar.popupOpen) eventCalendar.close()
     Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
   }
 
-  // Shared by both fields: Tab hops to the other one, Enter commits the pair,
-  // Escape drops the lot.
-  function handleLifeKey(event, other) {
-    if (event.key === Qt.Key_Escape) {
-      root.cancelEditingLife()
-      event.accepted = true
-    } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-      root.commitLife()
-      event.accepted = true
-    } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
-      other.selectAll()
-      other.forceActiveFocus()
-      event.accepted = true
+  function submitAdd() {
+    if (root.createLoading) return
+    var checked = Model.validateCreateInput({
+      calendarId: eventCalendar.value,
+      title: eventTitle.text,
+      date: eventDate.text,
+      start: eventStart.text,
+      end: eventEnd.text
+    })
+    if (!checked.valid) {
+      root.formError = checked.error
+      return
+    }
+    root.formError = ""
+    root.createLoading = true
+    var request = { action: "create" }
+    for (var key in checked.value) request[key] = checked.value[key]
+    root.enqueueRequest(request)
+  }
+
+  function eventTime(event) {
+    if (event.allDay) return "ALL DAY"
+    var start = new Date(event.start)
+    var end = new Date(event.end)
+    if (!isFinite(start.getTime()) || !isFinite(end.getTime())) return ""
+    return Qt.formatTime(start, "HH:mm") + "–" + Qt.formatTime(end, "HH:mm")
+  }
+
+  Process {
+    id: requestProcess
+    property string responseText: ""
+    property string errorText: ""
+    property bool timedOut: false
+    stdinEnabled: true
+
+    onStarted: {
+      requestTimeout.restart()
+      write(JSON.stringify(root.activeRequest) + "\n")
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: requestProcess.responseText = String(text || "")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: requestProcess.errorText = String(text || "")
+    }
+    onExited: function(exitCode) {
+      Qt.callLater(function() { root.finishRequest(exitCode) })
     }
   }
 
-  // Double-tapping the life bar puts it away again. The expectancy stays in
-  // the config so setting a birth year again brings your own number back
-  // rather than the default.
-  function clearLife() {
-    if (root.birthYear <= 0) return
-    persistSettings({ birthYear: 0 })
+  Timer {
+    id: requestTimeout
+    interval: 15000
+    repeat: false
+    onTriggered: {
+      if (!requestProcess.running) return
+      requestProcess.timedOut = true
+      requestProcess.signal(15)
+      requestHardKill.restart()
+    }
   }
 
-  function commitLife() {
-    var born = Model.parseBirthYear(bornField.text, today.getFullYear())
-    var span = Model.parseLifeExpectancy(expectancyField.text)
-    if (born !== root.birthYear || span !== root.lifeExpectancy)
-      persistSettings({ birthYear: born, lifeExpectancy: span })
-    cancelEditingLife()
-  }
-
-  function toggleWeekStart() {
-    setWeekStart(Model.toggledWeekStart(root.weekStart))
-  }
-
-  // Locale short day names, trimmed of the trailing period some locales
-  // carry ("man." -> "MAN") so the header row stays a clean band of caps.
-  function weekdayLabel(weekday) {
-    return String(Qt.locale().dayName(weekday, Locale.ShortFormat)).replace(/\.$/, "").toUpperCase()
+  Timer {
+    id: requestHardKill
+    interval: 500
+    repeat: false
+    onTriggered: if (requestProcess.running) requestProcess.signal(9)
   }
 
   SystemClock {
     id: clock
     precision: SystemClock.Minutes
     onDateChanged: {
-      if (Model.keyForDate(clock.date) === String(root.todayKey)) return
-      var followToday = root.viewingCurrentMonth
+      if (Model.keyForDate(clock.date) === root.todayKey) return
       root.today = clock.date
-      if (followToday) root.goToToday()
     }
   }
 
@@ -238,509 +411,379 @@ Panel {
     open: root.opened
     centerOnBar: true
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(560))
-    contentHeight: panel.fittedContentHeight(calendarColumn.implicitHeight)
+    contentWidth: panel.fittedContentWidth(Style.space(480))
+    contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.editingLife
-      onMoveRequested: function(dx, dy) {
-        if (dx !== 0) root.moveMonth(dx)
-        if (dy !== 0) root.moveYear(dy)
-      }
-      onActivateRequested: root.goToToday()
+      blocked: root.addingEvent || eventCalendar.popupOpen
+      onMoveRequested: function(dx, dy) { root.moveSelection(dx + dy * 7) }
+      onActivateRequested: root.selectedKey = root.todayKey
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) {
-        if (t === "[") root.moveMonth(-1)
-        else if (t === "]") root.moveMonth(1)
-        else if (t === "{") root.moveYear(-1)
-        else if (t === "}") root.moveYear(1)
-        else if (t === "t" || t === "T") root.goToToday()
-        else if (t === "w" || t === "W") root.toggleWeekStart()
+      onTextKey: function(text) {
+        if (text === "[") root.moveMonth(-1)
+        else if (text === "]") root.moveMonth(1)
+        else if (text === "t" || text === "T") {
+          root.viewYear = root.today.getFullYear()
+          root.viewMonth = root.today.getMonth()
+          root.selectedKey = root.todayKey
+          root.requestEventRange()
+        } else if (text === "a" || text === "A") root.startAdd()
+        else if (text === "r" || text === "R") root.refreshData(true)
       }
 
       Flickable {
-        id: calendarScroll
         anchors.fill: parent
-        contentWidth: calendarColumn.width
-        contentHeight: calendarColumn.implicitHeight
+        contentWidth: width
+        contentHeight: contentColumn.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
-        interactive: contentHeight > height || contentWidth > width
 
         Column {
-          id: calendarColumn
-          // Never narrower than the grid. The popup width is capped to what
-          // the screen allows, and a fixed seven-column grid would otherwise
-          // lose its last days off the edge instead of scrolling.
-          width: Math.max(calendarScroll.width, gridColumn.width)
-          spacing: Style.space(8)
+          id: contentColumn
+          width: parent.width
+          spacing: Style.space(10)
 
-          // ---- Hero: today, centered. Once the view has stepped back
-          //      it is also the way home — clicking the date you are
-          //      looking for beats hunting for a reset button.
-          Item {
-            width: parent.width
-            height: heroRow.height
+          Row {
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.space(12)
+
+            Button {
+              iconText: "󰅁"
+              tooltipText: "Previous month"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              focusable: true
+              onClicked: root.moveMonth(-1)
+            }
+            Text {
+              width: Style.space(230)
+              anchors.verticalCenter: parent.verticalCenter
+              horizontalAlignment: Text.AlignHCenter
+              text: Qt.formatDate(root.viewDate, "MMMM yyyy").toUpperCase()
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+              font.letterSpacing: 1
+            }
+            Button {
+              iconText: "󰅂"
+              tooltipText: "Next month"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              focusable: true
+              onClicked: root.moveMonth(1)
+            }
+          }
+
+          Column {
+            id: monthGrid
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: root.cellSpacing
 
             Row {
-              id: heroRow
-              anchors.horizontalCenter: parent.horizontalCenter
-              spacing: Style.space(22)
-
-              Text {
-                // Baseline-aligned, not center-aligned: "July 26" carries a
-                // descender, so centering the two boxes leaves the icon
-                // sitting visibly low against the digits.
-                anchors.baseline: heroDate.baseline
-                text: "󰃭"
-                color: heroMouse.containsMouse
-                  ? Style.hoverStateColor(root.contentForeground, Color.accent)
-                  : root.contentForeground
-                font.family: root.contentFontFamily
-                // Decorative, and deliberately outside the Style.font.*
-                // scale. Sized so the glyph reads at the cap height of the
-                // date beside it rather than towering over it.
-                font.pixelSize: 48
-              }
-
-              Text {
-                id: heroDate
-                anchors.verticalCenter: parent.verticalCenter
-                text: Qt.formatDate(root.today, "MMMM d")
-                color: heroMouse.containsMouse
-                  ? Style.hoverStateColor(root.contentForeground, Color.accent)
-                  : root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: 52
-                font.bold: true
-              }
-            }
-
-            MouseArea {
-              id: heroMouse
-              x: heroRow.x
-              y: heroRow.y
-              width: heroRow.width
-              height: heroRow.height
-              enabled: !root.viewingCurrentMonth
-              hoverEnabled: enabled
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.goToToday()
-
-              PanelToolTip {
-                visible: heroMouse.containsMouse
-                text: "Back to today"
-                fontFamily: root.contentFontFamily
-              }
-            }
-          }
-
-          // ---- Year progress, doubling as the rule under the hero:
-          //      a plain hairline said nothing, and whole days done
-          //      over days in the year says the same thing louder.
-          Item {
-            width: parent.width
-            height: yearBlock.y + yearBlock.height
-
-            Item {
-              id: yearBlock
-              y: Style.space(6)
-              anchors.horizontalCenter: parent.horizontalCenter
-              width: gridColumn.width
-              height: Math.max(yearLabel.implicitHeight, Style.space(10))
-
-              TapHandler {
-                enabled: !root.editingLife
-                onDoubleTapped: root.startEditingLife()
-              }
-
-              Row {
-                visible: root.editingLife
-                anchors.horizontalCenter: parent.horizontalCenter
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(10)
-
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: "BORN"
-                  color: Qt.darker(root.contentForeground, 1.5)
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  font.letterSpacing: 1
-                }
-
-                TextField {
-                  id: bornField
-                  width: Style.space(70)
-                  anchors.verticalCenter: parent.verticalCenter
-                  placeholderText: "year"
-                  foreground: root.contentForeground
-                  font.family: root.contentFontFamily
-                  inputMethodHints: Qt.ImhDigitsOnly
-
-                  Keys.onPressed: function(event) { root.handleLifeKey(event, expectancyField) }
-                }
-
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  anchors.verticalCenterOffset: 0
-                  leftPadding: Style.space(6)
-                  text: "LIVE TO"
-                  color: Qt.darker(root.contentForeground, 1.5)
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  font.letterSpacing: 1
-                }
-
-                TextField {
-                  id: expectancyField
-                  width: Style.space(60)
-                  anchors.verticalCenter: parent.verticalCenter
-                  placeholderText: "90"
-                  foreground: root.contentForeground
-                  font.family: root.contentFontFamily
-                  inputMethodHints: Qt.ImhDigitsOnly
-
-                  Keys.onPressed: function(event) { root.handleLifeKey(event, bornField) }
-                }
-              }
-
-              Text {
-                id: yearLabel
-                visible: !root.editingLife
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.today.getFullYear()
-                color: Qt.darker(root.contentForeground, 1.5)
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.letterSpacing: 1
-              }
-
-              Text {
-                id: yearPercent
-                visible: !root.editingLife
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.yearDonePercent + "%"
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
-
-              Rectangle {
-                id: yearTrack
-                visible: !root.editingLife
-                anchors.left: yearLabel.right
-                anchors.right: yearPercent.left
-                anchors.leftMargin: Style.space(12)
-                anchors.rightMargin: Style.space(12)
-                anchors.verticalCenter: parent.verticalCenter
-                height: Style.space(6)
-                radius: Style.cornerRadius > 0 ? height / 2 : 0
-                color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.12)
-
-                Rectangle {
-                  width: Math.round(parent.width * root.yearDone)
-                  height: parent.height
-                  radius: parent.radius
-                  color: Style.selectedStateColor(root.contentForeground, Color.accent)
-
-                  Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
-                }
-              }
-            }
-          }
-
-          // ---- Memento mori. Only here once someone has gone looking and
-          //      given an age; the same rail as the year above it, measured
-          //      against a nominal lifetime.
-          Item {
-            visible: root.birthYear > 0
-            width: parent.width
-            height: visible ? lifeBlock.height : 0
-
-            Item {
-              id: lifeBlock
-              anchors.horizontalCenter: parent.horizontalCenter
-              width: gridColumn.width
-              height: Math.max(lifeLabel.implicitHeight, Style.space(10))
-
-              Text {
-                id: lifeLabel
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: "LIFE"
-                color: Qt.darker(root.contentForeground, 1.5)
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.bodySmall
-                font.letterSpacing: 1
-              }
-
-              Text {
-                id: lifePercent
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.lifeDonePercent + "%"
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
-
-              Rectangle {
-                anchors.left: lifeLabel.right
-                anchors.right: lifePercent.left
-                anchors.leftMargin: Style.space(12)
-                anchors.rightMargin: Style.space(12)
-                anchors.verticalCenter: parent.verticalCenter
-                height: Style.space(6)
-                radius: Style.cornerRadius > 0 ? height / 2 : 0
-                color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.12)
-
-                Rectangle {
-                  width: Math.round(parent.width * root.lifeDone)
-                  height: parent.height
-                  radius: parent.radius
-                  color: Style.selectedStateColor(root.contentForeground, Color.accent)
-
-                  Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
-                }
-              }
-
-              TapHandler {
-                onDoubleTapped: root.clearLife()
-              }
-
-              MouseArea {
-                id: lifeMouse
-                anchors.fill: parent
-                hoverEnabled: true
-                acceptedButtons: Qt.NoButton
-
-                PanelToolTip {
-                  visible: lifeMouse.containsMouse
-                  text: "Memento Mori"
-                  fontFamily: root.contentFontFamily
-                }
-              }
-            }
-          }
-
-          // ---- Month grid: week numbers down a gutter on the left, then
-          //      the seven day columns. Always six rows, so the popup is
-          //      exactly as tall in February as it is in August.
-          Item {
-            width: parent.width
-            height: gridColumn.y + gridColumn.height
-
-            WheelHandler {
-              onWheel: function(event) {
-                // Horizontal wheels and touchpad side-scrolls report y === 0;
-                // without this they would every one read as "next month".
-                if (event.angleDelta.y === 0) return
-                root.moveMonth(event.angleDelta.y > 0 ? -1 : 1)
-              }
-            }
-
-            Column {
-              id: gridColumn
-              // The meter above is a solid rule; the grid needs room to
-              // read as its own block rather than hanging off it.
-              y: Style.space(18)
-              anchors.horizontalCenter: parent.horizontalCenter
-              spacing: Style.space(3)
-
-              Row {
-                id: headerRow
-                spacing: root.cellSpacing
-
-                // The week-number heading doubles as the week-start toggle.
-                // It is the one control in the panel whose meaning is not
-                // self-evident, so it carries a tooltip naming the day the
-                // click will switch to.
-                Rectangle {
-                  width: root.weekColumnWidth
-                  height: Style.space(16)
-                  radius: Style.cornerRadius
-                  color: weekStartMouse.containsMouse
-                    ? Style.hoverFillFor(root.contentForeground, Color.accent)
-                    : "transparent"
-
-                  Text {
-                    anchors.centerIn: parent
-                    text: "W"
-                    color: weekStartMouse.containsMouse
-                      ? Style.hoverStateColor(root.contentForeground, Color.accent)
-                      : Qt.darker(root.contentForeground, 1.9)
-                    font.family: root.contentFontFamily
-                    font.pixelSize: Style.font.caption
-                    font.letterSpacing: 1
-                    font.bold: true
-                  }
-
-                  MouseArea {
-                    id: weekStartMouse
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.toggleWeekStart()
-                  }
-
-                  PanelToolTip {
-                    visible: weekStartMouse.containsMouse
-                    text: "Start weeks on " + root.nextWeekStartLabel
-                    fontFamily: root.contentFontFamily
-                  }
-                }
-
-                Item {
-                  width: root.gutterWidth
-                  height: Style.space(16)
-                }
-
-                Repeater {
-                  model: root.weekdays
-
-                  Text {
-                    required property var modelData
-                    width: root.cellWidth
-                    height: Style.space(16)
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                    text: root.weekdayLabel(modelData)
-                    color: Qt.darker(root.contentForeground, 1.5)
-                    font.family: root.contentFontFamily
-                    font.pixelSize: Style.font.caption
-                    font.letterSpacing: 1
-                    font.bold: true
-                  }
-                }
-              }
-
+              spacing: root.cellSpacing
               Repeater {
-                model: root.weeks
-
-                Row {
+                model: root.weekdays
+                Text {
                   required property var modelData
-                  spacing: root.cellSpacing
+                  width: root.cellWidth
+                  height: Style.space(18)
+                  horizontalAlignment: Text.AlignHCenter
+                  text: root.weekdayLabel(modelData)
+                  color: Qt.darker(root.contentForeground, 1.5)
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+              }
+            }
 
-                  Text {
-                    width: root.weekColumnWidth
+            Repeater {
+              model: root.weeks
+              Row {
+                required property var modelData
+                spacing: root.cellSpacing
+                Repeater {
+                  model: modelData.days
+                  Rectangle {
+                    id: dayCell
+                    required property var modelData
+                    readonly property var dayEvents: root.eventsByDate[modelData.key] || []
+                    width: root.cellWidth
                     height: root.cellHeight
-                    horizontalAlignment: Text.AlignHCenter
-                    verticalAlignment: Text.AlignVCenter
-                    text: modelData.week
-                    color: Qt.darker(root.contentForeground, 1.9)
-                    font.family: root.contentFontFamily
-                    font.pixelSize: Style.font.caption
-                  }
+                    radius: Style.cornerRadius
+                    color: modelData.key === root.selectedKey
+                      ? Style.selectedFillFor(root.contentForeground, Color.accent) : "transparent"
+                    border.width: modelData.today || modelData.key === root.selectedKey ? Style.spacing.hairline : 0
+                    border.color: Style.normalBorderFor(root.contentForeground, Color.accent)
 
-                  Item {
-                    width: root.gutterWidth
-                    height: root.cellHeight
-                  }
-
-                  Repeater {
-                    model: modelData.days
-
-                    Rectangle {
-                      required property var modelData
-
-                      width: root.cellWidth
-                      height: root.cellHeight
-                      radius: Style.cornerRadius
-                      // Today is outlined, not filled: a lit-up block shouts
-                      // over a grid this quiet.
-                      color: "transparent"
-                      border.width: modelData.today ? Style.spacing.hairline : 0
-                      border.color: Style.normalBorderFor(root.contentForeground, Color.accent)
-
-                      Text {
-                        anchors.centerIn: parent
-                        text: modelData.day
-                        color: modelData.inMonth
-                          ? (modelData.weekend ? Qt.darker(root.contentForeground, 1.45) : root.contentForeground)
-                          : Qt.darker(root.contentForeground, 2.2)
-                        font.family: root.contentFontFamily
-                        font.pixelSize: Style.font.body
-                        font.bold: modelData.today
+                    Text {
+                      anchors.horizontalCenter: parent.horizontalCenter
+                      y: Style.space(3)
+                      text: dayCell.modelData.day
+                      color: dayCell.modelData.inMonth ? root.contentForeground : Qt.darker(root.contentForeground, 2.1)
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: dayCell.modelData.today || dayCell.modelData.key === root.selectedKey
+                    }
+                    Row {
+                      anchors.horizontalCenter: parent.horizontalCenter
+                      anchors.bottom: parent.bottom
+                      anchors.bottomMargin: Style.space(4)
+                      spacing: Style.space(2)
+                      Repeater {
+                        model: Math.min(3, dayCell.dayEvents.length)
+                        Rectangle {
+                          required property int index
+                          width: Style.space(4)
+                          height: width
+                          radius: width / 2
+                          color: dayCell.dayEvents[index].color
+                        }
                       }
+                    }
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.selectDay(dayCell.modelData)
                     }
                   }
                 }
               }
             }
+          }
 
-            // Hairline down the week-number gutter, drawn only beside the
-            // day rows so it does not cut through the header band.
-            Rectangle {
-              x: gridColumn.x + root.weekColumnWidth + root.cellSpacing + Math.round((root.gutterWidth - width) / 2)
-              y: gridColumn.y + headerRow.height + gridColumn.spacing
-              width: Style.spacing.hairline
-              height: gridColumn.height - headerRow.height - gridColumn.spacing
-              color: root.contentForeground
-              opacity: 0.1
+          Row {
+            width: monthGrid.width
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.space(8)
+            Text {
+              width: parent.width - addButton.width - parent.spacing
+              anchors.verticalCenter: parent.verticalCenter
+              text: "UPCOMING FROM " + root.selectedKey
+              color: Qt.darker(root.contentForeground, 1.35)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1
+            }
+            Button {
+              id: addButton
+              text: "Add"
+              iconText: "+"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              bordered: true
+              focusable: true
+              enabled: !root.calendarsLoading && root.calendars.length > 0
+              onClicked: root.startAdd()
             }
           }
 
-          // ---- Month stepping, spanning the grid it drives. The chevrons
-          //      sit on the grid's outer bounds, the same edges the year
-          //      rail above uses, so the row reads as the panel's other
-          //      full-width rail instead of a cluster floating in space.
-          //      The label is centered and fixed-width, so it holds still
-          //      from "MAY" to "SEPTEMBER".
-          Item {
-            width: parent.width
-            height: monthNav.height
+          Text {
+            visible: root.listLoading
+            width: monthGrid.width
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "Loading events…"
+            color: Qt.darker(root.contentForeground, 1.4)
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+          }
 
-            Item {
-              id: monthNav
-              anchors.horizontalCenter: parent.horizontalCenter
-              width: gridColumn.width
-              height: monthLabel.implicitHeight + Style.space(10)
+          Column {
+            visible: !root.listLoading && root.listError !== ""
+            width: monthGrid.width
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.space(4)
+            Text {
+              width: parent.width
+              text: root.listError
+              wrapMode: Text.Wrap
+              color: Color.urgent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+            }
+            Button {
+              text: "Retry"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              bordered: true
+              focusable: true
+              onClicked: root.requestEventRange()
+            }
+          }
 
-              Text {
-                id: monthLabel
-                anchors.horizontalCenter: parent.horizontalCenter
-                anchors.verticalCenter: parent.verticalCenter
-                // Fixed width so the chevrons hold still between a
-                // "MAY 2026" and a "SEPTEMBER 2026".
-                width: Style.space(130)
-                horizontalAlignment: Text.AlignHCenter
-                text: Qt.formatDate(root.viewDate, "MMMM yyyy").toUpperCase()
-                color: Qt.darker(root.contentForeground, 1.4)
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-                font.letterSpacing: 1
-              }
+          Text {
+            visible: !root.listLoading && root.listError === "" && root.agendaEvents.length === 0
+            width: monthGrid.width
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "No upcoming events in this view"
+            color: Qt.darker(root.contentForeground, 1.5)
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+          }
 
-              PanelActionButton {
-                // Pulled out by the button's own padding so the glyph, not
-                // its hit box, lines up with the "2026" on the year rail.
-                anchors.left: parent.left
-                anchors.leftMargin: -Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                iconText: "󰅁"
-                tooltipText: "Previous month"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                onClicked: root.moveMonth(-1)
-              }
-
-              PanelActionButton {
-                anchors.right: parent.right
-                anchors.rightMargin: -Style.space(8)
-                anchors.verticalCenter: parent.verticalCenter
-                iconText: "󰅂"
-                tooltipText: "Next month"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                onClicked: root.moveMonth(1)
+          Column {
+            visible: !root.listLoading && root.listError === ""
+            width: monthGrid.width
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.space(5)
+            Repeater {
+              model: root.agendaEvents
+              Rectangle {
+                required property var modelData
+                width: parent.width
+                height: agendaRow.implicitHeight + Style.space(10)
+                radius: Style.cornerRadius
+                color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.055)
+                Rectangle {
+                  width: Style.space(4)
+                  height: parent.height
+                  radius: parent.radius
+                  color: modelData.color
+                }
+                Row {
+                  id: agendaRow
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(12)
+                  anchors.rightMargin: Style.space(8)
+                  spacing: Style.space(8)
+                  Text {
+                    width: Style.space(92)
+                    text: modelData.startKey + "\n" + root.eventTime(modelData)
+                    color: Qt.darker(root.contentForeground, 1.35)
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  Text {
+                    width: parent.width - Style.space(100)
+                    text: modelData.title + "\n" + modelData.calendarName
+                    elide: Text.ElideRight
+                    color: root.contentForeground
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.body
+                  }
+                }
               }
             }
+          }
+
+          Column {
+            visible: root.addingEvent
+            width: monthGrid.width
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.space(7)
+            Keys.onEscapePressed: root.cancelAdd()
+
+            Text {
+              text: "NEW EVENT"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              font.letterSpacing: 1
+            }
+            Dropdown {
+              id: eventCalendar
+              width: parent.width
+              label: "Calendar"
+              value: ""
+              options: root.calendarOptions
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              onChanged: function(value) { root.formError = "" }
+            }
+            TextField {
+              id: eventTitle
+              width: parent.width
+              placeholderText: "Title"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              enabled: !root.createLoading
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) { root.cancelAdd(); event.accepted = true }
+                else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.submitAdd(); event.accepted = true }
+              }
+            }
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+              TextField {
+                id: eventDate
+                width: parent.width - eventStart.width - eventEnd.width - parent.spacing * 2
+                placeholderText: "YYYY-MM-DD"
+                foreground: root.contentForeground
+                font.family: root.contentFontFamily
+                enabled: !root.createLoading
+                Keys.onEscapePressed: root.cancelAdd()
+              }
+              TextField {
+                id: eventStart
+                width: Style.space(82)
+                placeholderText: "09:00"
+                foreground: root.contentForeground
+                font.family: root.contentFontFamily
+                enabled: !root.createLoading
+                inputMethodHints: Qt.ImhDigitsOnly
+                Keys.onEscapePressed: root.cancelAdd()
+              }
+              TextField {
+                id: eventEnd
+                width: Style.space(82)
+                placeholderText: "10:00"
+                foreground: root.contentForeground
+                font.family: root.contentFontFamily
+                enabled: !root.createLoading
+                inputMethodHints: Qt.ImhDigitsOnly
+                Keys.onEscapePressed: root.cancelAdd()
+              }
+            }
+            Text {
+              visible: root.formError !== ""
+              width: parent.width
+              text: root.formError
+              wrapMode: Text.Wrap
+              color: Color.urgent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Row {
+              anchors.right: parent.right
+              spacing: Style.space(6)
+              Button {
+                text: "Cancel"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                focusable: true
+                onClicked: root.cancelAdd()
+              }
+              Button {
+                text: root.createLoading ? "Creating…" : "Create"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                bordered: true
+                focusable: true
+                enabled: !root.createLoading
+                onClicked: root.submitAdd()
+              }
+            }
+          }
+
+          Text {
+            visible: !root.addingEvent && (root.calendarError !== "" || root.backendStatus !== "")
+            width: monthGrid.width
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: root.calendarError || root.backendStatus
+            wrapMode: Text.Wrap
+            color: Qt.darker(root.contentForeground, 1.5)
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
           }
         }
       }

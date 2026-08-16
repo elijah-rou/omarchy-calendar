@@ -267,6 +267,198 @@ function stepMonth(year, month, delta) {
   return { year: target.getFullYear(), month: target.getMonth() }
 }
 
+// ---- Calendar event data. The backend is deliberately treated as an
+// untrusted protocol boundary: malformed records are dropped and strings are
+// bounded before they become QML model data.
+var MAX_EVENTS = 512
+var MAX_EVENT_DAYS = 370
+
+function trimmed(value, limit) {
+  var text = String(value === undefined || value === null ? "" : value).replace(/^\s+|\s+$/g, "")
+  return text.length > limit ? text.substr(0, limit) : text
+}
+
+function validDateKey(value) {
+  var text = String(value || "")
+  var match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text)
+  if (!match) return false
+  var year = Number(match[1])
+  var month = Number(match[2])
+  var day = Number(match[3])
+  var date = new Date(Date.UTC(year, month - 1, day))
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+}
+
+function dateFromKey(key) {
+  if (!validDateKey(key)) return null
+  var parts = String(key).split("-")
+  return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]))
+}
+
+function keyFromEventValue(value, allDay) {
+  var text = String(value || "")
+  if (allDay && validDateKey(text.substr(0, 10))) return text.substr(0, 10)
+  var date = new Date(text)
+  return isFinite(date.getTime()) ? keyForDate(date) : ""
+}
+
+function normalizeEvent(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  var title = trimmed(value.title, 300)
+  var calendarId = trimmed(value.calendarId, 200)
+  var calendarName = trimmed(value.calendarName, 200)
+  var start = trimmed(value.start, 80)
+  var end = trimmed(value.end, 80)
+  var allDay = value.allDay === true
+  var startKey = keyFromEventValue(start, allDay)
+  var endKey = keyFromEventValue(end, allDay)
+  if (title === "" || calendarId === "" || startKey === "" || endKey === "") return null
+
+  var startTime = new Date(start).getTime()
+  var endTime = new Date(end).getTime()
+  if (!allDay && (!isFinite(startTime) || !isFinite(endTime) || endTime <= startTime)) return null
+  if (allDay && endKey <= startKey) return null
+
+  var color = trimmed(value.color, 32)
+  if (!/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(color)) color = "#7aa2f7"
+  return {
+    start: start,
+    end: end,
+    title: title,
+    calendarId: calendarId,
+    calendarName: calendarName || calendarId,
+    allDay: allDay,
+    color: color,
+    startKey: startKey,
+    endKey: endKey
+  }
+}
+
+function normalizeEvents(values) {
+  if (!Array.isArray(values)) return []
+  var events = []
+  for (var i = 0; i < values.length && events.length < MAX_EVENTS; i++) {
+    var event = normalizeEvent(values[i])
+    if (event) events.push(event)
+  }
+  events.sort(function(a, b) {
+    if (a.start < b.start) return -1
+    if (a.start > b.start) return 1
+    return a.title < b.title ? -1 : (a.title > b.title ? 1 : 0)
+  })
+  return events
+}
+
+// Returns every local day touched by an event. All-day end dates follow the
+// calendar convention and are exclusive; timed events ending at midnight do
+// not mark the following day.
+function eventDateKeys(value) {
+  var event = value && value.startKey ? value : normalizeEvent(value)
+  if (!event) return []
+  var first = dateFromKey(event.startKey)
+  if (!first) return []
+
+  var lastKey = event.endKey
+  if (event.allDay) {
+    var exclusive = dateFromKey(event.endKey)
+    if (!exclusive) return []
+    exclusive.setDate(exclusive.getDate() - 1)
+    lastKey = keyForDate(exclusive)
+    if (lastKey < event.startKey) lastKey = event.startKey
+  } else {
+    var end = new Date(new Date(event.end).getTime() - 1)
+    if (!isFinite(end.getTime())) return []
+    lastKey = keyForDate(end)
+  }
+
+  var keys = []
+  var cursor = first
+  while (keys.length < MAX_EVENT_DAYS) {
+    var key = keyForDate(cursor)
+    if (key > lastKey) break
+    keys.push(key)
+    cursor.setDate(cursor.getDate() + 1)
+  }
+  return keys
+}
+
+function mapEventsByDate(values) {
+  var events = normalizeEvents(values)
+  var mapped = {}
+  for (var i = 0; i < events.length; i++) {
+    var keys = eventDateKeys(events[i])
+    for (var j = 0; j < keys.length; j++) {
+      if (!mapped[keys[j]]) mapped[keys[j]] = []
+      mapped[keys[j]].push(events[i])
+    }
+  }
+  return mapped
+}
+
+function upcomingEvents(values, fromKey, limit) {
+  if (!validDateKey(fromKey)) return []
+  var max = Math.max(1, Math.min(50, Math.round(Number(limit) || 8)))
+  var events = normalizeEvents(values)
+  var selected = []
+  for (var i = 0; i < events.length && selected.length < max; i++) {
+    var keys = eventDateKeys(events[i])
+    if (keys.length > 0 && keys[keys.length - 1] >= fromKey) selected.push(events[i])
+  }
+  return selected
+}
+
+function militaryTime(value) {
+  var match = /^(\d{2}):(\d{2})$/.exec(String(value || ""))
+  if (!match) return null
+  var hour = Number(match[1])
+  var minute = Number(match[2])
+  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 ? hour * 60 + minute : null
+}
+
+function invalidCreate(field, error) {
+  return { valid: false, field: field, error: error, value: null }
+}
+
+function validateCreateInput(input) {
+  var value = input && typeof input === "object" ? input : {}
+  var calendarId = trimmed(value.calendarId, 200)
+  var title = trimmed(value.title, 200)
+  var date = trimmed(value.date, 10)
+  var start = trimmed(value.start, 5)
+  var end = trimmed(value.end, 5)
+  if (calendarId === "") return invalidCreate("calendarId", "Choose a calendar")
+  if (title === "") return invalidCreate("title", "Enter a title")
+  if (!validDateKey(date)) return invalidCreate("date", "Use a valid date (YYYY-MM-DD)")
+  var startMinute = militaryTime(start)
+  if (startMinute === null) return invalidCreate("start", "Use 24-hour start time (HH:MM)")
+  var endMinute = militaryTime(end)
+  if (endMinute === null) return invalidCreate("end", "Use 24-hour end time (HH:MM)")
+  if (endMinute <= startMinute) return invalidCreate("end", "End must be after start")
+  return {
+    valid: true,
+    field: "",
+    error: "",
+    value: {
+      calendarId: calendarId,
+      title: title,
+      start: date + "T" + start + ":00",
+      end: date + "T" + end + ":00",
+      allDay: false
+    }
+  }
+}
+
+function localPathForUrl(value) {
+  var text = String(value || "")
+  if (text.indexOf("file:///") !== 0 || /[?#]/.test(text)) return ""
+  try {
+    var path = decodeURIComponent(text.substr(7))
+    return path.indexOf("\0") === -1 && path.charAt(0) === "/" ? path : ""
+  } catch (error) {
+    return ""
+  }
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     dateKey: dateKey,
@@ -288,6 +480,15 @@ if (typeof module !== "undefined") {
     lifeProgressPercent: lifeProgressPercent,
     monthGrid: monthGrid,
     stepMonth: stepMonth,
+    validDateKey: validDateKey,
+    normalizeEvent: normalizeEvent,
+    normalizeEvents: normalizeEvents,
+    eventDateKeys: eventDateKeys,
+    mapEventsByDate: mapEventsByDate,
+    upcomingEvents: upcomingEvents,
+    militaryTime: militaryTime,
+    validateCreateInput: validateCreateInput,
+    localPathForUrl: localPathForUrl,
     clockFormats: clockFormats,
     clockFormatRing: clockFormatRing,
     nextClockFormat: nextClockFormat,

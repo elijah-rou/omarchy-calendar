@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "elijahrou.calendar",
   "name": "Omarchy Calendar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Elijah Roussos",
   "description": "Calendar, agenda, and event creation for the Omarchy bar",
   "kinds": [
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Omarchy Calendar",
-    "description": "Calendar, agenda, and event creation",
+    "description": "Clock with month markers, upcoming agenda, and event creation",
     "category": "Time",
     "allowMultiple": false,
     "defaultSection": "center",
