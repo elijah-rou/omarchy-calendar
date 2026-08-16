@@ -23,6 +23,7 @@ MAX_EVENTS = 256
 MAX_RANGE_DAYS = 366
 COMMAND_TIMEOUT_SECONDS = 30
 SYNC_TIMEOUT_SECONDS = 300
+ACTIVE_PROCESS: subprocess.Popen[bytes] | None = None
 JSON_FIELDS = (
     "uid",
     "title",
@@ -150,7 +151,15 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=1)
 
 
+def handle_termination(signum: int, _frame: Any) -> None:
+    process = ACTIVE_PROCESS
+    if process is not None:
+        terminate_process_group(process)
+    raise SystemExit(128 + signum)
+
+
 def run_command(argv: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+    global ACTIVE_PROCESS
     assert argv
     assert timeout > 0
     try:
@@ -165,6 +174,7 @@ def run_command(argv: list[str], timeout: int) -> subprocess.CompletedProcess[st
     except OSError as error:
         raise CommandError(Path(argv[0]).name, str(error)) from error
 
+    ACTIVE_PROCESS = process
     assert process.stdout is not None
     assert process.stderr is not None
     stdout_buffer = bytearray()
@@ -194,6 +204,7 @@ def run_command(argv: list[str], timeout: int) -> subprocess.CompletedProcess[st
         streams.close()
         if process.poll() is None:
             terminate_process_group(process)
+        ACTIVE_PROCESS = None
 
     stdout = stdout_buffer.decode("utf-8", errors="replace")
     stderr = stderr_buffer.decode("utf-8", errors="replace")
@@ -469,11 +480,22 @@ def read_request() -> dict[str, Any]:
         raise ProtocolError("invalid_json", "request is not valid UTF-8 JSON") from error
 
 
-def emit(response: dict[str, Any]) -> None:
+def encode_response(response: dict[str, Any]) -> bytes:
     encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) > MAX_RESPONSE_BYTES:
-        encoded = b'{"ok":false,"error":{"code":"response_too_large","message":"response exceeds protocol limit"}}'
-    sys.stdout.buffer.write(encoded + b"\n")
+        fallback: dict[str, Any] = {
+            "ok": False,
+            "error": {"code": "response_too_large", "message": "response exceeds protocol limit"},
+        }
+        request_id = response.get("requestId")
+        if isinstance(request_id, str):
+            fallback["requestId"] = request_id
+        encoded = json.dumps(fallback, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return encoded
+
+
+def emit(response: dict[str, Any]) -> None:
+    sys.stdout.buffer.write(encode_response(response) + b"\n")
     sys.stdout.buffer.flush()
 
 
@@ -496,4 +518,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGINT, handle_termination)
     raise SystemExit(main())

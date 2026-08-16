@@ -381,7 +381,7 @@ Panel {
 
   Timer {
     id: requestTimeout
-    interval: root.activeRequest && (root.activeRequest.action === "list" || root.activeRequest.action === "create") ? 45000 : 15000
+    interval: 45000
     repeat: false
     onTriggered: {
       if (!requestProcess.running) return

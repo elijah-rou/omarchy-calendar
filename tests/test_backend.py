@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -206,6 +207,19 @@ class BackendProtocolTests(IsolatedEnvironment):
         oversize = self.run_backend({}, raw=b"{" + b" " * (64 * 1024))
         self.assertEqual(oversize["error"]["code"], "request_too_large")
 
+    def test_oversize_response_preserves_request_id(self) -> None:
+        spec = importlib.util.spec_from_file_location("calendar_backend_test", ROOT / "backend" / "calendar_backend.py")
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.MAX_RESPONSE_BYTES = 128
+        encoded = module.encode_response({"ok": True, "requestId": "large-id", "events": ["x" * 512]})
+        response = json.loads(encoded)
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["requestId"], "large-id")
+        self.assertEqual(response["error"]["code"], "response_too_large")
+
     def test_command_output_is_bounded(self) -> None:
         self.env["HUGE_OUTPUT"] = "1"
         response = self.run_backend({
@@ -315,7 +329,13 @@ class SetupTests(IsolatedEnvironment):
             "--password-command", "secret-tool", "--configure-only",
         )
         config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
+        khal = config.with_name("khal.conf")
+        khal.write_text("CUSTOM-KHAL\n", encoding="utf-8")
+        synced = Path(self.env["XDG_DATA_HOME"]) / "omarchy-calendar" / "calendars" / "synced"
+        sentinel = synced / "existing.ics"
+        sentinel.write_text("existing", encoding="utf-8")
         before = config.read_text()
+        before_khal = khal.read_text()
         self.env["FAIL_SYNC"] = "1"
         result = subprocess.run(
             [
@@ -330,6 +350,8 @@ class SetupTests(IsolatedEnvironment):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(config.read_text(), before)
+        self.assertEqual(khal.read_text(), before_khal)
+        self.assertEqual(sentinel.read_text(), "existing")
 
     @unittest.skipUnless(shutil.which("vdirsyncer"), "vdirsyncer is not installed")
     def test_generated_caldav_config_loads_with_vdirsyncer_020(self) -> None:

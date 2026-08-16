@@ -7,6 +7,7 @@ import datetime as dt
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -54,18 +55,32 @@ def main() -> int:
         print(status["error"], file=sys.stderr)
         return 1
     try:
-        result = subprocess.run(
-            [executable, "-c", str(config), "sync"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=TIMEOUT_SECONDS,
-            check=False,
-        )
-        error = result.stderr[:MAX_ERROR_BYTES].decode("utf-8", errors="replace").strip()
-        status = {"attempted": True, "ok": result.returncode == 0, "at": started}
-        if result.returncode != 0:
-            status["error"] = error or f"vdirsyncer exited with status {result.returncode}"
+        with tempfile.TemporaryFile() as error_stream:
+            process = subprocess.Popen(
+                [executable, "-c", str(config), "sync"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=error_stream,
+                start_new_session=True,
+            )
+            try:
+                returncode = process.wait(timeout=TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=1)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=1)
+                raise
+            error_stream.seek(0)
+            error = error_stream.read(MAX_ERROR_BYTES).decode("utf-8", errors="replace").strip()
+        status = {"attempted": True, "ok": returncode == 0, "at": started}
+        if returncode != 0:
+            status["error"] = error or f"vdirsyncer exited with status {returncode}"
     except subprocess.TimeoutExpired:
         status = {"attempted": True, "ok": False, "at": started, "error": f"sync timed out after {TIMEOUT_SECONDS} seconds"}
     except OSError as error:

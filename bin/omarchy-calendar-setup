@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from collections.abc import Sequence
@@ -101,9 +102,15 @@ print_new = event
 """
 
 
-def vdirsyncer_config(paths: dict[str, Path], remote_block: str) -> str:
-    status = paths["state"] / "vdirsyncer-status"
-    synced = paths["data"] / "calendars" / "synced"
+def vdirsyncer_config(
+    paths: dict[str, Path],
+    remote_block: str,
+    *,
+    status: Path | None = None,
+    synced: Path | None = None,
+) -> str:
+    status = status or paths["state"] / "vdirsyncer-status"
+    synced = synced or paths["data"] / "calendars" / "synced"
     return f"""[general]
 status_path = {quoted(str(status))}
 
@@ -140,6 +147,20 @@ def bootstrap(remote: bool) -> dict[str, Path]:
     return paths
 
 
+def terminate_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=1)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=1)
+
+
 def run(argv: list[str], timeout: int = TIMEOUT_SECONDS) -> None:
     assert argv
     executable = shutil.which(argv[0])
@@ -147,30 +168,81 @@ def run(argv: list[str], timeout: int = TIMEOUT_SECONDS) -> None:
         raise SystemExit(f"required command is not installed: {argv[0]}")
     argv[0] = executable
     try:
-        subprocess.run(argv, stdin=subprocess.DEVNULL, timeout=timeout, check=True)
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as error:
+        raise SystemExit(f"failed to start command: {Path(argv[0]).name}") from error
+    try:
+        returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as error:
+        terminate_group(process)
         raise SystemExit(f"command timed out after {timeout} seconds: {Path(argv[0]).name}") from error
-    except subprocess.CalledProcessError as error:
-        raise SystemExit(f"command failed with exit status {error.returncode}: {Path(argv[0]).name}") from error
+    if returncode != 0:
+        raise SystemExit(f"command failed with exit status {returncode}: {Path(argv[0]).name}")
+
+
+def restore_file(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        path.unlink(missing_ok=True)
+    else:
+        atomic_write(path, previous.decode("utf-8"), 0o600)
 
 
 def configure_remote(remote_block: str, configure_only: bool) -> None:
-    paths = bootstrap(remote=False)
+    paths = app_paths()
+    assert_outside_source(paths)
     config_path = paths["config"] / "vdirsyncer.conf"
-    descriptor, candidate_name = tempfile.mkstemp(prefix=".vdirsyncer-candidate-", dir=paths["config"])
-    os.close(descriptor)
-    candidate_path = Path(candidate_name)
-    candidate_path.unlink()
-    atomic_write(candidate_path, vdirsyncer_config(paths, remote_block), 0o600)
-    try:
-        if not configure_only:
+    khal_path = paths["config"] / "khal.conf"
+    previous_config = config_path.read_bytes() if config_path.is_file() else None
+    previous_khal = khal_path.read_bytes() if khal_path.is_file() else None
+    paths = bootstrap(remote=False)
+    final_config = vdirsyncer_config(paths, remote_block)
+
+    candidate_root: Path | None = None
+    active_synced = paths["data"] / "calendars" / "synced"
+    backup_synced: Path | None = None
+    if not configure_only:
+        candidate_root = Path(tempfile.mkdtemp(prefix=".remote-candidate-", dir=paths["data"]))
+        os.chmod(candidate_root, 0o700)
+        candidate_synced = candidate_root / "synced"
+        candidate_synced.mkdir(mode=0o700)
+        candidate_status = candidate_root / "status"
+        candidate_path = candidate_root / "vdirsyncer.conf"
+        atomic_write(
+            candidate_path,
+            vdirsyncer_config(paths, remote_block, status=candidate_status, synced=candidate_synced),
+            0o600,
+        )
+        try:
             run(["vdirsyncer", "-c", str(candidate_path), "discover"])
             run(["vdirsyncer", "-c", str(candidate_path), "sync"])
-        os.replace(candidate_path, config_path)
-        atomic_write(paths["config"] / "khal.conf", khal_config(paths, True), 0o600)
+        except BaseException:
+            restore_file(khal_path, previous_khal)
+            restore_file(config_path, previous_config)
+            shutil.rmtree(candidate_root, ignore_errors=True)
+            raise
+
+        backup_synced = Path(tempfile.mkdtemp(prefix=".synced-backup-", dir=active_synced.parent))
+        backup_synced.rmdir()
+        os.replace(active_synced, backup_synced)
+        os.replace(candidate_synced, active_synced)
+
+    try:
+        atomic_write(khal_path, khal_config(paths, True), 0o600)
+        atomic_write(config_path, final_config, 0o600)
     except BaseException:
-        candidate_path.unlink(missing_ok=True)
+        restore_file(khal_path, previous_khal)
+        restore_file(config_path, previous_config)
+        if backup_synced is not None:
+            shutil.rmtree(active_synced, ignore_errors=True)
+            os.replace(backup_synced, active_synced)
         raise
+    else:
+        if backup_synced is not None:
+            shutil.rmtree(backup_synced, ignore_errors=True)
+    finally:
+        if candidate_root is not None:
+            shutil.rmtree(candidate_root, ignore_errors=True)
+
     print(f"configured calendar data in {paths['data']}")
     print(f"configuration: {paths['config']}")
 
