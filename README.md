@@ -83,9 +83,12 @@ and expose it through a lookup command:
 
 Remote setup writes configuration, runs `vdirsyncer discover`, then performs an
 initial sync. Add `--configure-only` to any remote setup command to generate and
-inspect configuration without network access. A subsequent remote setup replaces
-the current remote profile but never removes the separate local calendar.
-OAuth tokens are written by vdirsyncer to the private XDG state directory.
+inspect configuration without network access. The plugin currently supports one
+remote profile. A subsequent remote setup replaces that profile and its synced
+data, but never removes the separate local calendar. Google OAuth tokens are
+isolated by account and credential generation in the private XDG state directory.
+The previous Google token and widget-owned secret are invalidated only after the
+replacement has completed successfully.
 
 Install the checked-in systemd user units and enable a sync every 15 minutes:
 
@@ -95,6 +98,36 @@ Install the checked-in systemd user units and enable a sync every 15 minutes:
 
 This copies the sync command to `~/.local/bin`, copies the service and timer to
 the user systemd directory, reloads the user manager, and enables the timer.
+
+### Widget-driven remote setup
+
+`bin/omarchy-calendar setup-request` accepts exactly one newline-terminated JSON
+object on standard input. This endpoint is intended for the widget: the
+plaintext `secret` is accepted only in that request and is sent immediately to
+`secret-tool store` over its standard input. It never appears in command
+arguments, the environment, generated configuration, logs, or protocol output.
+The generated vdirsyncer configuration looks the value up with a fixed argv
+array and no shell.
+
+Requests are limited to 64 KiB and require a `requestId`, `provider`, and
+`secret`. Provider-specific fields are:
+
+```json
+{"requestId":"setup-1","provider":"caldav","displayName":"Work","username":"me@example.com","url":"https://calendar.example.com/dav/","secret":"app password"}
+{"requestId":"setup-2","provider":"icloud","username":"me@icloud.com","secret":"app-specific password"}
+{"requestId":"setup-3","provider":"google","clientId":"CLIENT_ID.apps.googleusercontent.com","secret":"desktop OAuth client secret"}
+```
+
+`displayName` is optional for every provider. CalDAV URLs must use HTTP(S) and
+must not contain embedded credentials. Google setup starts vdirsyncer's browser
+OAuth flow. Every provider performs discovery and an initial sync within the
+five-minute per-command bound.
+
+Output is bounded NDJSON: zero or more progress objects followed by exactly one
+object with `"type":"result"` and `"final":true`. The final result includes
+`replacesExisting`, which is true when the single existing remote profile was
+replaced. Failed and cancelled attempts remove their candidate credential,
+token, configuration, and data while preserving the active profile.
 
 ## Backend protocol
 
@@ -146,7 +179,10 @@ misreport the local creation.
 
 `calendars` returns khal's configured names. `status` reports whether local and
 remote configuration exist, installed command versions, and the bounded last
-sync result. It does not contact a remote service.
+sync result. Its `remoteAccount` object provides `connected`, the known provider
+and display name, and a `setupMode` of `connect` or `replace`, allowing the
+widget to label the one-profile replacement behavior before setup. It does not
+contact a remote service.
 
 Errors have this form:
 

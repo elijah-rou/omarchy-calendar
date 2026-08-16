@@ -68,6 +68,7 @@ def paths() -> dict[str, Path]:
         "state": state,
         "khal_config": config / "khal.conf",
         "vdirsyncer_config": config / "vdirsyncer.conf",
+        "remote_profile": config / "remote-profile.json",
         "sync_status": state / "sync-status.json",
     }
 
@@ -421,6 +422,25 @@ def executable_version(name: str) -> str | None:
     return output[:256]
 
 
+def read_remote_profile(path: Path) -> tuple[str | None, str | None]:
+    try:
+        raw = path.read_bytes()
+        if len(raw) > 16 * 1024:
+            return None, None
+        profile = json.loads(raw)
+    except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None, None
+    if not isinstance(profile, dict):
+        return None, None
+    provider = profile.get("provider")
+    display_name = profile.get("displayName")
+    if provider not in ("google", "caldav", "icloud"):
+        provider = None
+    if not isinstance(display_name, str) or len(display_name.encode("utf-8")) > 256:
+        display_name = None
+    return provider, display_name
+
+
 def request_status(request: dict[str, Any]) -> dict[str, Any]:
     validate_keys(request, {"action", "requestId"}, {"action"})
     current_paths = paths()
@@ -433,10 +453,22 @@ def request_status(request: dict[str, Any]) -> dict[str, Any]:
                 last_sync = candidate
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         pass
+    sync_configured = current_paths["vdirsyncer_config"].is_file()
+    provider, display_name = read_remote_profile(current_paths["remote_profile"])
+    if not sync_configured:
+        provider = None
+        display_name = None
     return {
         "ok": True,
         "configured": current_paths["khal_config"].is_file(),
-        "syncConfigured": current_paths["vdirsyncer_config"].is_file(),
+        "syncConfigured": sync_configured,
+        "remoteAccount": {
+            "connected": sync_configured,
+            "provider": provider,
+            "displayName": display_name,
+            "setupMode": "replace" if sync_configured else "connect",
+            "singleProfile": True,
+        },
         "versions": {"khal": executable_version("khal"), "vdirsyncer": executable_version("vdirsyncer")},
         "lastSync": last_sync,
     }

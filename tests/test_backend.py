@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "bin" / "omarchy-calendar"
 BACKEND = ROOT / "bin" / "omarchy-calendar-backend"
 SETUP = ROOT / "bin" / "omarchy-calendar-setup"
+SETUP_REQUEST = ROOT / "bin" / "omarchy-calendar-setup-request"
 SYNC = ROOT / "bin" / "omarchy-calendar-sync"
 
 
@@ -39,6 +40,7 @@ class IsolatedEnvironment(unittest.TestCase):
                 "XDG_CACHE_HOME": str(root / "cache"),
                 "PATH": f"{self.bin}:{self.env.get('PATH', '')}",
                 "COMMAND_LOG": str(root / "commands.log"),
+                "SECRET_INPUT_LOG": str(root / "secret-input.log"),
             }
         )
         Path(self.env["HOME"]).mkdir()
@@ -100,6 +102,48 @@ if "--version" in args:
 elif os.environ.get("FAIL_SYNC") == "1" and "sync" in args:
     print("remote unavailable", file=sys.stderr)
     raise SystemExit(4)
+'''
+
+FAKE_SECRET_TOOL_SETUP = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with pathlib.Path(os.environ["COMMAND_LOG"]).open("a") as stream:
+    stream.write("secret-tool " + json.dumps(args) + "\n")
+if args and args[0] == "store":
+    secret = sys.stdin.read()
+    with pathlib.Path(os.environ["SECRET_INPUT_LOG"]).open("a") as stream:
+        stream.write(secret)
+    if os.environ.get("FAIL_SECRET_STORE") == "1":
+        print(secret, file=sys.stderr)
+        raise SystemExit(3)
+elif args and args[0] == "lookup":
+    print("stored-secret")
+elif args and args[0] == "clear":
+    pass
+else:
+    raise SystemExit(2)
+'''
+
+FAKE_VDIRSYNCER_SETUP = r'''#!/usr/bin/env python3
+import json, os, pathlib, re, sys
+args = sys.argv[1:]
+with pathlib.Path(os.environ["COMMAND_LOG"]).open("a") as stream:
+    stream.write("vdirsyncer " + json.dumps(args) + "\n")
+config = pathlib.Path(args[args.index("-c") + 1])
+content = config.read_text()
+if os.environ.get("FAIL_SETUP") == args[-1]:
+    print("super-secret-value: remote rejected setup", file=sys.stderr)
+    raise SystemExit(130 if os.environ.get("CANCEL_SETUP") == "1" else 7)
+path_match = re.search(r'^path = (".*")$', content, re.MULTILINE)
+if path_match:
+    synced = pathlib.Path(json.loads(path_match.group(1)))
+    synced.mkdir(parents=True, exist_ok=True)
+    if args[-1] == "sync":
+        (synced / "remote.ics").write_text("candidate")
+token_match = re.search(r'^token_file = (".*")$', content, re.MULTILINE)
+if token_match and args[-1] == "discover":
+    token = pathlib.Path(json.loads(token_match.group(1)))
+    token.write_text(json.dumps({"token": config.parent.name}))
 '''
 
 
@@ -379,6 +423,169 @@ class SetupTests(IsolatedEnvironment):
         remote = parsed["storages"][1]
         self.assertEqual(remote["type"], "caldav")
         self.assertEqual(remote["password.fetch"], ["command", "secret-tool"])
+
+
+class WidgetSetupRequestTests(IsolatedEnvironment):
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_command("secret-tool", FAKE_SECRET_TOOL_SETUP)
+        self.write_command("vdirsyncer", FAKE_VDIRSYNCER_SETUP)
+
+    def run_setup_request(
+        self, request: object | None = None, *, raw: bytes | None = None
+    ) -> tuple[subprocess.CompletedProcess[bytes], list[dict[str, Any]]]:
+        payload = raw if raw is not None else json.dumps(request).encode() + b"\n"
+        result = subprocess.run(
+            [str(SETUP_REQUEST)],
+            input=payload,
+            capture_output=True,
+            env=self.env,
+            timeout=10,
+            check=True,
+        )
+        lines = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(sum(line.get("final") is True for line in lines), 1)
+        self.assertTrue(lines[-1]["final"])
+        return result, lines
+
+    def test_caldav_stores_stdin_secret_and_emits_progress_then_one_final(self) -> None:
+        secret = "super-secret-value"
+        result, lines = self.run_setup_request({
+            "requestId": "setup-caldav",
+            "provider": "caldav",
+            "displayName": "Work",
+            "username": "person@example.test",
+            "url": "https://calendar.example.test/dav/",
+            "secret": secret,
+        })
+        final = lines[-1]
+        self.assertTrue(final["ok"])
+        self.assertFalse(final["replacesExisting"])
+        self.assertTrue(any(line.get("stage") == "discovering" for line in lines))
+        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
+        content = config.read_text()
+        self.assertIn('password.fetch = ["command", "secret-tool", "lookup", "service", "omarchy-calendar"', content)
+        self.assertNotIn(secret, content)
+        self.assertEqual(Path(self.env["SECRET_INPUT_LOG"]).read_text(), secret)
+        command_log = Path(self.env["COMMAND_LOG"]).read_text()
+        self.assertNotIn(secret, command_log)
+        self.assertNotIn(secret.encode(), result.stdout)
+        self.assertNotIn(secret.encode(), result.stderr)
+        self.assertIn('secret-tool ["store", "--label=Omarchy Calendar remote credential"', command_log)
+        self.assertIn('vdirsyncer ["-c"', command_log)
+        self.assertLess(max(len(line) for line in result.stdout.splitlines()), 16 * 1024)
+
+        status = self.run_backend({"action": "status"})
+        self.assertEqual(status["remoteAccount"], {
+            "connected": True,
+            "provider": "caldav",
+            "displayName": "Work",
+            "setupMode": "replace",
+            "singleProfile": True,
+        })
+
+    def test_failed_or_cancelled_setup_cleans_candidate_and_preserves_active_state(self) -> None:
+        _, first_lines = self.run_setup_request({
+            "requestId": "first",
+            "provider": "caldav",
+            "username": "first@example.test",
+            "url": "https://first.example.test/",
+            "secret": "first-secret",
+        })
+        self.assertTrue(first_lines[-1]["ok"])
+        config_dir = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
+        data_dir = Path(self.env["XDG_DATA_HOME"]) / "omarchy-calendar" / "calendars" / "synced"
+        before_config = (config_dir / "vdirsyncer.conf").read_bytes()
+        before_khal = (config_dir / "khal.conf").read_bytes()
+        before_profile = (config_dir / "remote-profile.json").read_bytes()
+        before_data = (data_dir / "remote.ics").read_bytes()
+
+        self.env["FAIL_SETUP"] = "discover"
+        self.env["CANCEL_SETUP"] = "1"
+        result, failed_lines = self.run_setup_request({
+            "requestId": "cancelled",
+            "provider": "google",
+            "displayName": "Personal",
+            "clientId": "client.apps.googleusercontent.com",
+            "secret": "super-secret-value",
+        })
+        final = failed_lines[-1]
+        self.assertFalse(final["ok"])
+        self.assertEqual(final["error"]["code"], "cancelled")
+        self.assertNotIn(b"super-secret-value", result.stdout + result.stderr)
+        self.assertEqual((config_dir / "vdirsyncer.conf").read_bytes(), before_config)
+        self.assertEqual((config_dir / "khal.conf").read_bytes(), before_khal)
+        self.assertEqual((config_dir / "remote-profile.json").read_bytes(), before_profile)
+        self.assertEqual((data_dir / "remote.ics").read_bytes(), before_data)
+        command_lines = Path(self.env["COMMAND_LOG"]).read_text().splitlines()
+        self.assertTrue(command_lines[-1].startswith('secret-tool ["clear"'))
+        tokens = list((Path(self.env["XDG_STATE_HOME"]) / "omarchy-calendar").glob("google-token-*.json"))
+        self.assertEqual(tokens, [])
+
+    def test_successful_google_replacement_uses_isolated_token_and_clears_only_old_state(self) -> None:
+        state = Path(self.env["XDG_STATE_HOME"]) / "omarchy-calendar"
+        _, first_lines = self.run_setup_request({
+            "requestId": "google-one",
+            "provider": "google",
+            "clientId": "one.apps.googleusercontent.com",
+            "secret": "client-one-secret",
+        })
+        self.assertTrue(first_lines[-1]["ok"])
+        first_tokens = list(state.glob("google-token-*.json"))
+        self.assertEqual(len(first_tokens), 1)
+        first_token = first_tokens[0]
+        first_token_content = first_token.read_bytes()
+
+        self.env["FAIL_SETUP"] = "sync"
+        _, failed_lines = self.run_setup_request({
+            "requestId": "google-two-failed",
+            "provider": "google",
+            "clientId": "two.apps.googleusercontent.com",
+            "secret": "client-two-secret",
+        })
+        self.assertFalse(failed_lines[-1]["ok"])
+        self.assertTrue(first_token.is_file())
+        self.assertEqual(first_token.read_bytes(), first_token_content)
+        self.assertEqual(len(list(state.glob("google-token-*.json"))), 1)
+
+        self.env.pop("FAIL_SETUP")
+        _, replacement_lines = self.run_setup_request({
+            "requestId": "google-two-success",
+            "provider": "google",
+            "displayName": "Second Google",
+            "clientId": "two.apps.googleusercontent.com",
+            "secret": "client-two-secret",
+        })
+        final = replacement_lines[-1]
+        self.assertTrue(final["ok"])
+        self.assertTrue(final["replacesExisting"])
+        self.assertFalse(first_token.exists())
+        new_tokens = list(state.glob("google-token-*.json"))
+        self.assertEqual(len(new_tokens), 1)
+        config = (Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf").read_text()
+        self.assertIn(str(new_tokens[0]), config)
+        self.assertNotIn(str(first_token), config)
+        clear_lines = [
+            line for line in Path(self.env["COMMAND_LOG"]).read_text().splitlines()
+            if line.startswith('secret-tool ["clear"')
+        ]
+        self.assertGreaterEqual(len(clear_lines), 2)
+
+    def test_request_is_newline_delimited_bounded_and_provider_specific(self) -> None:
+        _, no_newline = self.run_setup_request(raw=b'{"requestId":"x"}')
+        self.assertEqual(no_newline[-1]["error"]["code"], "invalid_json")
+        _, oversized = self.run_setup_request(raw=b"{" + b" " * (64 * 1024) + b"\n")
+        self.assertEqual(oversized[-1]["error"]["code"], "request_too_large")
+        _, invalid = self.run_setup_request({
+            "requestId": "bad-fields",
+            "provider": "icloud",
+            "username": "person@icloud.test",
+            "url": "https://must-not-be-accepted.test/",
+            "secret": "app-password",
+        })
+        self.assertEqual(invalid[-1]["error"]["code"], "invalid_request")
+        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
 
 
 class SyncTests(IsolatedEnvironment):

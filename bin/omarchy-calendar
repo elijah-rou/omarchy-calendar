@@ -15,11 +15,14 @@ case "$command_name" in
     setup)
         exec "$script_dir/omarchy-calendar-setup" "$@"
         ;;
+    setup-request)
+        exec "$script_dir/omarchy-calendar-setup-request" "$@"
+        ;;
     sync)
         exec "$script_dir/omarchy-calendar-sync" "$@"
         ;;
     ""|-h|--help)
-        printf '%s\n' 'Usage: omarchy-calendar <request|setup|sync> [arguments...]'
+        printf '%s\n' 'Usage: omarchy-calendar <request|setup|setup-request|sync> [arguments...]'
         ;;
     *)
         printf 'omarchy-calendar: unknown command: %s\n' "$command_name" >&2

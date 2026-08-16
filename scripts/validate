@@ -11,6 +11,7 @@ import py_compile
 for script in (
     "bin/omarchy-calendar-backend",
     "bin/omarchy-calendar-setup",
+    "bin/omarchy-calendar-setup-request",
     "bin/omarchy-calendar-sync",
 ):
     py_compile.compile(script, doraise=True)
@@ -20,7 +21,7 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 
 if command -v ruff >/dev/null 2>&1; then
   ruff check backend tests
-  for script in bin/omarchy-calendar-backend bin/omarchy-calendar-setup bin/omarchy-calendar-sync; do
+  for script in bin/omarchy-calendar-backend bin/omarchy-calendar-setup bin/omarchy-calendar-setup-request bin/omarchy-calendar-sync; do
     ruff check --stdin-filename "$script.py" - < "$script"
   done
 fi
@@ -28,7 +29,7 @@ if command -v shellcheck >/dev/null 2>&1; then
   shellcheck bin/omarchy-calendar scripts/validate scripts/validate-qml
 fi
 
-for script in bin/omarchy-calendar bin/omarchy-calendar-backend bin/omarchy-calendar-setup bin/omarchy-calendar-sync scripts/validate scripts/validate-qml; do
+for script in bin/omarchy-calendar bin/omarchy-calendar-backend bin/omarchy-calendar-setup bin/omarchy-calendar-setup-request bin/omarchy-calendar-sync scripts/validate scripts/validate-qml; do
   test -x "$script" || { printf 'not executable: %s\n' "$script" >&2; exit 1; }
 done
 
