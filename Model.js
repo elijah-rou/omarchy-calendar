@@ -446,7 +446,8 @@ function durableSetupFields(input) {
   var displayName = trimmed(source.displayName, 256)
   if (displayName !== "") value.displayName = displayName
   if (provider === "google") {
-    value.clientId = trimmed(source.clientId, 512)
+    var clientId = trimmed(source.clientId, 512)
+    if (clientId !== "") value.clientId = clientId
   } else if (provider === "caldav" || provider === "icloud") {
     value.username = trimmed(source.username, 512)
     if (provider === "caldav") value.url = trimmed(source.url, 4096)
@@ -541,8 +542,19 @@ function validateSetupInput(input) {
     return invalidInput("displayName", "Display name is too long or contains a line break")
 
   if (value.provider === "google") {
+    var rawClientFile = String(source.clientFile === undefined || source.clientFile === null ? "" : source.clientFile)
     var rawClientId = String(source.clientId === undefined || source.clientId === null ? "" : source.clientId)
-    if (value.clientId === "") return invalidInput("clientId", "Enter the Google Desktop OAuth client ID")
+    var rawGoogleSecret = String(source.secret === undefined || source.secret === null ? "" : source.secret)
+    if (rawClientFile !== "") {
+      if (rawClientId !== "" || rawGoogleSecret !== "")
+        return invalidInput("clientFile", "Use either imported JSON or manual OAuth credentials")
+      if (rawClientFile.charAt(0) !== "/" || utf8Length(rawClientFile) > 4096
+          || /[\x00-\x1f\x7f]/.test(rawClientFile))
+        return invalidInput("clientFile", "Choose one local Google Desktop OAuth JSON file")
+      value.clientFile = rawClientFile
+      return { valid: true, field: "", error: "", value: value }
+    }
+    if (!value.clientId) return invalidInput("clientId", "Import the Desktop OAuth JSON or enter its client ID")
     if (utf8Length(rawClientId.replace(/^\s+|\s+$/g, "")) > 512 || /[\x00\r\n]/.test(rawClientId))
       return invalidInput("clientId", "OAuth client ID is too long or contains a line break")
   } else {

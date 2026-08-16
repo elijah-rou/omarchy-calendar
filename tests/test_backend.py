@@ -681,6 +681,151 @@ class WidgetSetupRequestTests(IsolatedEnvironment):
         installation_values = [value[value.index("installation") + 1] for value in attributes]
         self.assertEqual(len(set(installation_values)), 2)
 
+    def write_google_client_file(
+        self,
+        name: str = "google-client.json",
+        *,
+        document: object | None = None,
+        raw: bytes | None = None,
+    ) -> Path:
+        path = Path(self.temporary.name) / name
+        if raw is not None:
+            path.write_bytes(raw)
+        else:
+            value = document if document is not None else {
+                "installed": {
+                    "client_id": "imported.apps.googleusercontent.com",
+                    "project_id": "calendar-test",
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                    "client_secret": "imported-client-secret",
+                    "redirect_uris": ["http://localhost"],
+                }
+            }
+            path.write_text(json.dumps(value), encoding="utf-8")
+        return path
+
+    def test_google_import_uses_file_secret_without_leaking_or_deleting_source(self) -> None:
+        client_file = self.write_google_client_file()
+        source_before = client_file.read_bytes()
+        secret = "imported-client-secret"
+        result, lines = self.run_setup_request({
+            "requestId": "google-import",
+            "provider": "google",
+            "displayName": "Personal Google",
+            "clientFile": str(client_file),
+        })
+
+        self.assertTrue(lines[-1]["ok"])
+        self.assertTrue(client_file.is_file())
+        self.assertEqual(client_file.read_bytes(), source_before)
+        self.assertEqual(Path(self.env["SECRET_INPUT_LOG"]).read_text(), secret)
+        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
+        config = (config_root / "vdirsyncer.conf").read_text()
+        profile = (config_root / "remote-profile.json").read_text()
+        status = self.run_backend({"action": "status", "requestId": "status-after-google-import"})
+        command_log = Path(self.env["COMMAND_LOG"]).read_text()
+        self.assertIn('client_id = "imported.apps.googleusercontent.com"', config)
+        self.assertNotIn(secret, config)
+        self.assertNotIn(secret, profile)
+        self.assertNotIn(secret, command_log)
+        self.assertNotIn(secret, json.dumps(status))
+        self.assertNotIn(secret.encode(), result.stdout + result.stderr)
+        self.assertNotIn("clientFile", profile)
+
+    def test_google_client_file_rejects_malformed_noninstalled_and_invalid_values(self) -> None:
+        cases = {
+            "malformed.json": b'{"installed":',
+            "web.json": json.dumps({
+                "web": {"client_id": "web-id", "client_secret": "must-not-leak-web-secret"}
+            }).encode(),
+            "missing-secret.json": json.dumps({
+                "installed": {"client_id": "desktop-id"}
+            }).encode(),
+            "multiline-secret.json": json.dumps({
+                "installed": {"client_id": "desktop-id", "client_secret": "line-one\nline-two"}
+            }).encode(),
+            "multiline-client-id.json": json.dumps({
+                "installed": {"client_id": "desktop\nid", "client_secret": "secret"}
+            }).encode(),
+            "oversize-client-id.json": json.dumps({
+                "installed": {"client_id": "i" * 513, "client_secret": "secret"}
+            }).encode(),
+            "oversize-secret.json": json.dumps({
+                "installed": {"client_id": "desktop-id", "client_secret": "s" * (16 * 1024 + 1)}
+            }).encode(),
+        }
+        for index, (name, raw) in enumerate(cases.items()):
+            with self.subTest(name=name):
+                path = self.write_google_client_file(name, raw=raw)
+                result, lines = self.run_setup_request({
+                    "requestId": f"invalid-google-json-{index}",
+                    "provider": "google",
+                    "clientFile": str(path),
+                })
+                self.assertFalse(lines[-1]["ok"])
+                self.assertEqual(lines[-1]["error"]["code"], "invalid_client_file")
+                self.assertNotIn(b"must-not-leak-web-secret", result.stdout + result.stderr)
+        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
+
+    def test_google_client_file_rejects_oversize_symlink_and_nonregular_file(self) -> None:
+        oversize = Path(self.temporary.name) / "oversize.json"
+        with oversize.open("wb") as stream:
+            stream.truncate(64 * 1024 + 1)
+        target = self.write_google_client_file("target.json")
+        symlink = Path(self.temporary.name) / "linked.json"
+        symlink.symlink_to(target)
+        directory = Path(self.temporary.name) / "directory.json"
+        directory.mkdir()
+
+        for index, path in enumerate((oversize, symlink, directory)):
+            with self.subTest(path=path.name):
+                _, lines = self.run_setup_request({
+                    "requestId": f"unsafe-google-file-{index}",
+                    "provider": "google",
+                    "clientFile": str(path),
+                })
+                self.assertFalse(lines[-1]["ok"])
+                self.assertEqual(lines[-1]["error"]["code"], "invalid_client_file")
+        self.assertTrue(target.is_file())
+        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
+
+    def test_google_client_file_path_bounds_and_provider_rules(self) -> None:
+        client_file = self.write_google_client_file()
+        requests = (
+            {
+                "requestId": "relative-google-file",
+                "provider": "google",
+                "clientFile": "Downloads/client.json",
+            },
+            {
+                "requestId": "oversize-google-path",
+                "provider": "google",
+                "clientFile": "/" + "x" * 4096,
+            },
+            {
+                "requestId": "mixed-google-input",
+                "provider": "google",
+                "clientFile": str(client_file),
+                "clientId": "manual.apps.googleusercontent.com",
+                "secret": "manual-secret",
+            },
+            {
+                "requestId": "icloud-google-file",
+                "provider": "icloud",
+                "username": "person@icloud.test",
+                "secret": "app-password",
+                "clientFile": str(client_file),
+            },
+        )
+        for request in requests:
+            with self.subTest(request_id=request["requestId"]):
+                _, lines = self.run_setup_request(request)
+                self.assertFalse(lines[-1]["ok"])
+                self.assertEqual(lines[-1]["error"]["code"], "invalid_request")
+        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
+
     def test_google_browser_event_is_validated_and_unrelated_output_is_not_forwarded(self) -> None:
         self.env["EMIT_GOOGLE_URL"] = "1"
         result, lines = self.run_setup_request({

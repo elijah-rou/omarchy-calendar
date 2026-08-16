@@ -25,6 +25,8 @@ APP = "omarchy-calendar"
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024
 MAX_SECRET_BYTES = 16 * 1024
+MAX_CLIENT_FILE_PATH_BYTES = 4096
+MAX_GOOGLE_CLIENT_FILE_BYTES = 64 * 1024
 MAX_ACTIVE_FILE_BYTES = 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 64 * 1024
 MAX_AUTHORIZATION_URL_BYTES = 8192
@@ -291,7 +293,89 @@ def validate_caldav_url(url: str) -> None:
             raise SetupError("invalid_request", "url hostname is malformed")
 
 
-def validate_request(raw_request: Any) -> tuple[dict[str, str], bytearray]:
+def google_client_value(installed: dict[str, Any], key: str, maximum: int) -> str:
+    value = installed.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SetupError("invalid_client_file", "selected file is not a valid Google Desktop OAuth JSON file")
+    if len(value.encode("utf-8")) > maximum or any(
+        ord(character) < 0x20 or ord(character) == 0x7F for character in value
+    ):
+        raise SetupError("invalid_client_file", "selected file is not a valid Google Desktop OAuth JSON file")
+    return value
+
+
+def read_google_client_file(path_text: str) -> tuple[str, bytearray]:
+    if not Path(path_text).is_absolute() or any(
+        ord(character) < 0x20 or ord(character) == 0x7F for character in path_text
+    ):
+        raise SetupError("invalid_request", "clientFile must be a bounded absolute path")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path_text, flags)
+    except OSError as error:
+        raise SetupError(
+            "invalid_client_file", "selected Google OAuth JSON must be a readable regular file"
+        ) from error
+
+    raw_buffer = bytearray(MAX_GOOGLE_CLIENT_FILE_BYTES + 1)
+    document: Any = None
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_GOOGLE_CLIENT_FILE_BYTES:
+                raise SetupError(
+                    "invalid_client_file", "selected Google OAuth JSON must be a bounded regular file"
+                )
+            offset = 0
+            view = memoryview(raw_buffer)
+            try:
+                while offset < len(raw_buffer):
+                    count = os.readv(descriptor, [view[offset:]])
+                    if count == 0:
+                        break
+                    offset += count
+            finally:
+                view.release()
+            if offset > MAX_GOOGLE_CLIENT_FILE_BYTES:
+                raise SetupError(
+                    "invalid_client_file", "selected Google OAuth JSON exceeds its safety limit"
+                )
+            del raw_buffer[offset:]
+        finally:
+            os.close(descriptor)
+
+        try:
+            document = json.loads(raw_buffer)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise SetupError(
+                "invalid_client_file", "selected file is not a valid Google Desktop OAuth JSON file"
+            ) from error
+        if not isinstance(document, dict) or set(document) != {"installed"}:
+            raise SetupError(
+                "invalid_client_file", "selected file is not a valid Google Desktop OAuth JSON file"
+            )
+        installed = document["installed"]
+        if not isinstance(installed, dict):
+            raise SetupError(
+                "invalid_client_file", "selected file is not a valid Google Desktop OAuth JSON file"
+            )
+        client_id = google_client_value(installed, "client_id", 512)
+        client_secret = google_client_value(installed, "client_secret", MAX_SECRET_BYTES)
+        secret_buffer = bytearray(client_secret.encode("utf-8"))
+        installed["client_secret"] = ""
+        client_secret = ""
+        return client_id, secret_buffer
+    finally:
+        if isinstance(document, dict):
+            installed_value = document.get("installed")
+            if isinstance(installed_value, dict):
+                installed_value["client_secret"] = ""
+            document.clear()
+        raw_buffer[:] = b"\x00" * len(raw_buffer)
+
+
+def _validate_request_with_inline_secret(raw_request: Any) -> tuple[dict[str, str], bytearray]:
     if not isinstance(raw_request, dict):
         raise SetupError("invalid_request", "request must be a JSON object")
     provider = bounded_string(raw_request, "provider", maximum=16, required=True)
@@ -340,6 +424,39 @@ def validate_request(raw_request: Any) -> tuple[dict[str, str], bytearray]:
             validated["url"] = url
     secret_buffer = bytearray(secret.encode("utf-8"))
     secret = ""
+    return validated, secret_buffer
+
+
+def validate_request(raw_request: Any) -> tuple[dict[str, str], bytearray]:
+    if not isinstance(raw_request, dict) or raw_request.get("provider") != "google" or "clientFile" not in raw_request:
+        return _validate_request_with_inline_secret(raw_request)
+
+    provider = bounded_string(raw_request, "provider", maximum=16, required=True)
+    request_id = bounded_string(raw_request, "requestId", maximum=128, required=True)
+    display_name = bounded_string(raw_request, "displayName", maximum=256)
+    client_file = bounded_string(
+        raw_request, "clientFile", maximum=MAX_CLIENT_FILE_PATH_BYTES, required=True
+    )
+    assert provider == "google"
+    assert request_id is not None
+    assert client_file is not None
+
+    allowed = {"requestId", "provider", "displayName", "clientFile"}
+    unknown = sorted(set(raw_request) - allowed)
+    missing = sorted({"requestId", "provider", "clientFile"} - set(raw_request))
+    if unknown:
+        raise SetupError("invalid_request", f"unknown fields: {', '.join(unknown)}")
+    if missing:
+        raise SetupError("invalid_request", f"missing fields: {', '.join(missing)}")
+
+    client_id, secret_buffer = read_google_client_file(client_file)
+    validated = {
+        "requestId": request_id,
+        "provider": provider,
+        "clientId": client_id,
+    }
+    if display_name is not None:
+        validated["displayName"] = display_name
     return validated, secret_buffer
 
 

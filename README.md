@@ -69,9 +69,33 @@ store. The setup command supplies the CalDAV URL:
   --password-arg calendars/icloud
 ```
 
-Google synchronization uses vdirsyncer's browser-based OAuth flow. Create a
-Google OAuth desktop client, store its client secret outside this repository,
-and expose it through a lookup command:
+### Guided Google OAuth setup
+
+Google synchronization uses vdirsyncer's browser-based OAuth flow with a
+Desktop OAuth client that you own:
+
+1. Open [Google Auth Platform clients](https://console.cloud.google.com/auth/clients)
+   and create or select a Google Cloud project.
+2. In **APIs & Services → Library**, enable **Google Calendar API** for that
+   project.
+3. In **Google Auth Platform**, complete **Branding** and **Audience**. For a
+   personal app, choose **External**. If its publishing status is **Testing**,
+   add the Google account you will connect under **Audience → Test users**.
+4. Return to **Clients**, choose **Create client**, set **Application type** to
+   **Desktop app**, create it, and choose **Download JSON**.
+5. Open Calendar settings, keep **Google** selected, choose **Import Desktop
+   OAuth JSON**, select the downloaded file, and click **Connect**. Finish the
+   authorization in the browser that opens.
+
+Only Google's standard downloaded `installed` JSON shape is accepted; Web
+application credentials are not. The plugin reads the selected file only for
+that setup attempt and does not modify or delete it. Personal External apps
+left in Testing must include the connected account as a test user and may
+require periodic reconnects because Google can expire testing refresh tokens.
+
+Manual client ID and secret entry remains available in the widget as an
+advanced fallback. The command-line flow can instead fetch the secret from a
+private lookup command:
 
 ```sh
 ./bin/omarchy-calendar setup google \
@@ -109,17 +133,25 @@ arguments, the environment, generated configuration, logs, or protocol output.
 The generated vdirsyncer configuration looks the value up with a fixed argv
 array and no shell.
 
-Requests are limited to 64 KiB and require a `requestId`, `provider`, and
-`secret`. Provider-specific fields are:
+Requests are limited to 64 KiB and require a `requestId` and `provider`.
+CalDAV and iCloud require `secret`; Google accepts either manual `clientId` plus
+`secret`, or one bounded absolute `clientFile` path naming the downloaded
+Desktop OAuth JSON. Provider-specific examples are:
 
 ```json
 {"requestId":"setup-1","provider":"caldav","displayName":"Work","username":"me@example.com","url":"https://calendar.example.com/dav/","secret":"app password"}
 {"requestId":"setup-2","provider":"icloud","username":"me@icloud.com","secret":"app-specific password"}
-{"requestId":"setup-3","provider":"google","clientId":"CLIENT_ID.apps.googleusercontent.com","secret":"desktop OAuth client secret"}
+{"requestId":"setup-3","provider":"google","clientFile":"/home/me/Downloads/client_secret.json"}
+{"requestId":"setup-4","provider":"google","clientId":"CLIENT_ID.apps.googleusercontent.com","secret":"desktop OAuth client secret"}
 ```
 
-`displayName` is optional for every provider. CalDAV URLs must use HTTP(S) and
-must not contain embedded credentials. Google setup starts vdirsyncer's browser
+`displayName` is optional for every provider. CalDAV URLs must use HTTPS and
+must not contain embedded credentials. Google `clientFile` input must be an
+absolute path to one regular, nonsymlink, bounded JSON file with the standard
+`installed` shape. The file is never deleted. Its secret is read into the same
+transient secret buffer as manual setup, sent only to `secret-tool store` on
+standard input, and omitted from NDJSON, errors, status, generated config,
+arguments, the environment, and logs. Google setup starts vdirsyncer's browser
 OAuth flow. Every provider performs discovery and an initial sync within the
 five-minute per-command bound.
 

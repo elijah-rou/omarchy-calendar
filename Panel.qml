@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Dialogs
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -58,6 +59,7 @@ Panel {
   property int setupResponseCharacters: 0
   property int setupResponseLines: 0
   property bool setupReplacesExisting: false
+  property string setupClientFilePath: ""
 
   property int requestSequence: 0
   property var requestQueue: []
@@ -72,6 +74,7 @@ Panel {
   readonly property bool setupBusy: setupProcess.running || root.setupState === "running" || root.setupState === "cancelling"
   readonly property bool anyOperationBusy: root.requestBusy || root.setupBusy
   readonly property string helperPath: Model.localPathForUrl(Qt.resolvedUrl("bin/omarchy-calendar"))
+  readonly property string googleCloudSetupUrl: "https://console.cloud.google.com/auth/clients"
 
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
@@ -406,6 +409,7 @@ Panel {
     setupUrl.text = ""
     setupClientId.text = ""
     setupSecret.text = ""
+    root.setupClientFilePath = ""
     Qt.callLater(function() { setupProvider.forceActiveFocus() })
   }
 
@@ -414,9 +418,24 @@ Panel {
     setupProcess.requestText = ""
   }
 
+  function acceptGoogleClientFile(fileUrl) {
+    if (root.setupBusy || setupProvider.value !== "google") return
+    var path = Model.localPathForUrl(String(fileUrl || ""))
+    if (path === "") {
+      root.setupError = "Choose one local JSON file"
+      return
+    }
+    setupClientId.text = ""
+    setupSecret.text = ""
+    root.resetSetupFeedback()
+    root.setupClientFilePath = path
+    root.setupMessage = "Desktop OAuth JSON selected. Click Connect to continue."
+  }
+
   function closeSetupForm() {
     if (root.setupBusy) return
     root.clearSetupSecret()
+    root.setupClientFilePath = ""
     root.addingAccount = false
     root.setupState = "idle"
     root.setupStage = ""
@@ -454,6 +473,7 @@ Panel {
       username: setupUsername.text,
       url: setupUrl.text,
       clientId: setupClientId.text,
+      clientFile: root.setupClientFilePath,
       secret: setupSecret.text
     })
     if (!checked.valid) {
@@ -591,6 +611,14 @@ Panel {
     return Qt.formatTime(start, "HH:mm") + "–" + Qt.formatTime(end, "HH:mm")
   }
 
+  FileDialog {
+    id: googleClientFileDialog
+    title: "Import Google Desktop OAuth JSON"
+    fileMode: FileDialog.OpenFile
+    nameFilters: ["JSON files (*.json)"]
+    onAccepted: root.acceptGoogleClientFile(selectedFile)
+  }
+
   Process {
     id: requestProcess
     property string responseText: ""
@@ -645,6 +673,7 @@ Panel {
       write(outgoing + "\n")
       outgoing = ""
       root.clearSetupSecret()
+      root.setupClientFilePath = ""
     }
     stdout: SplitParser {
       splitMarker: "\n"
@@ -1034,13 +1063,14 @@ Panel {
               enabled: !root.setupBusy
               onChanged: function(value) {
                 setupSecret.text = ""
+                root.setupClientFilePath = ""
                 root.resetSetupFeedback()
               }
             }
             Text {
               width: parent.width
               text: setupProvider.value === "google"
-                ? "Google uses a Desktop OAuth client ID and OAuth client secret. Setup opens your browser to authorize access."
+                ? "Create your own Google Desktop OAuth client, import its downloaded JSON, then authorize calendar access."
                 : (setupProvider.value === "icloud"
                   ? "iCloud requires your Apple ID and an app-specific password, not your Apple ID password."
                   : "Enter the CalDAV server URL, username, and app password or account secret.")
@@ -1049,6 +1079,51 @@ Panel {
               color: Qt.darker(root.contentForeground, 1.35)
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.bodySmall
+            }
+            Column {
+              visible: setupProvider.value === "google"
+              width: parent.width
+              spacing: Style.space(6)
+
+              Text {
+                width: parent.width
+                text: "1. Open Google Cloud, select a project, enable Google Calendar API, and configure OAuth consent.\n2. Create an OAuth client with application type Desktop app, then download its JSON.\n3. Import that JSON here and click Connect. External testing apps must include your account as a test user."
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                color: root.contentForeground
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+              Button {
+                width: parent.width
+                text: "Open Google Cloud setup"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                bordered: true
+                focusable: true
+                enabled: !root.setupBusy
+                onClicked: Qt.openUrlExternally(root.googleCloudSetupUrl)
+              }
+              Button {
+                width: parent.width
+                text: "Import Desktop OAuth JSON"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                bordered: true
+                focusable: true
+                enabled: !root.setupBusy
+                onClicked: googleClientFileDialog.open()
+              }
+              Text {
+                visible: root.setupClientFilePath !== ""
+                width: parent.width
+                text: "Desktop OAuth JSON selected. The backend reads it only during secure setup."
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                color: Color.accent
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
             }
             TextField {
               id: setupDisplayName
@@ -1059,6 +1134,16 @@ Panel {
               enabled: !root.setupBusy
               onTextChanged: root.resetSetupFeedback()
             }
+            Text {
+              visible: setupProvider.value === "google"
+              width: parent.width
+              text: "Advanced fallback: enter the Desktop client ID and secret manually."
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              color: Qt.darker(root.contentForeground, 1.35)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
             TextField {
               id: setupClientId
               visible: setupProvider.value === "google"
@@ -1068,7 +1153,10 @@ Panel {
               font.family: root.contentFontFamily
               enabled: !root.setupBusy
               inputMethodHints: Qt.ImhNoPredictiveText
-              onTextChanged: root.resetSetupFeedback()
+              onTextChanged: {
+                if (text !== "") root.setupClientFilePath = ""
+                root.resetSetupFeedback()
+              }
             }
             TextField {
               id: setupUsername
@@ -1101,7 +1189,10 @@ Panel {
               enabled: !root.setupBusy
               echoMode: TextInput.Password
               inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
-              onTextChanged: root.resetSetupFeedback()
+              onTextChanged: {
+                if (setupProvider.value === "google" && text !== "") root.setupClientFilePath = ""
+                root.resetSetupFeedback()
+              }
               Keys.onPressed: function(event) {
                 if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                   root.submitAccountSetup()

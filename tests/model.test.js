@@ -122,6 +122,43 @@ function testSetupValidation() {
   assert.equal(JSON.stringify(durable).includes('never-store'), false)
 }
 
+function testGoogleClientFileSetupValidation() {
+  const imported = Model.validateSetupInput({
+    provider: 'google', displayName: ' Personal ',
+    clientFile: '/home/person/Downloads/client.json'
+  })
+  assert.equal(imported.valid, true)
+  assert.deepEqual(imported.value, {
+    provider: 'google', displayName: 'Personal',
+    clientFile: '/home/person/Downloads/client.json'
+  })
+
+  const durable = Model.durableSetupFields({
+    provider: 'google', displayName: 'Personal',
+    clientFile: '/home/person/Downloads/client.json',
+    clientId: 'manual-client', secret: 'never-persist'
+  })
+  assert.deepEqual(durable, {
+    provider: 'google', displayName: 'Personal', clientId: 'manual-client'
+  })
+  assert.equal(JSON.stringify(durable).includes('client.json'), false)
+  assert.equal(JSON.stringify(durable).includes('never-persist'), false)
+
+  assert.equal(Model.validateSetupInput({
+    provider: 'google', clientFile: 'Downloads/client.json'
+  }).field, 'clientFile')
+  assert.equal(Model.validateSetupInput({
+    provider: 'google', clientFile: '/tmp/client\n.json'
+  }).field, 'clientFile')
+  assert.equal(Model.validateSetupInput({
+    provider: 'google', clientFile: '/' + 'x'.repeat(4096)
+  }).field, 'clientFile')
+  assert.equal(Model.validateSetupInput({
+    provider: 'google', clientFile: '/tmp/client.json',
+    clientId: 'manual-client', secret: 'manual-secret'
+  }).field, 'clientFile')
+}
+
 function testSetupProtocolLifecycle() {
   const state = { browserSeen: false, finalSeen: false }
   const malformed = Model.parseSetupProtocolLine('{bad', 'request-1', state)
@@ -186,6 +223,7 @@ function testCreateValidation() {
 testEventNormalization()
 testDateMapping()
 testSetupValidation()
+testGoogleClientFileSetupValidation()
 testSetupProtocolLifecycle()
 testCreateValidation()
 console.log('Model.js tests passed')
