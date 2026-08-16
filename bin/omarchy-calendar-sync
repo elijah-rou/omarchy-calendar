@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import json
 import os
 import shutil
@@ -40,10 +41,7 @@ def write_status(path: Path, status: dict[str, object]) -> None:
         raise
 
 
-def main() -> int:
-    os.umask(0o077)
-    config = xdg_path("XDG_CONFIG_HOME", ".config") / "omarchy-calendar" / "vdirsyncer.conf"
-    status_path = xdg_path("XDG_STATE_HOME", ".local/state") / "omarchy-calendar" / "sync-status.json"
+def run_sync(config: Path, status_path: Path) -> int:
     started = dt.datetime.now(dt.timezone.utc).isoformat()
     executable = shutil.which("vdirsyncer")
     if not config.is_file():
@@ -90,6 +88,31 @@ def main() -> int:
         print(status["error"], file=sys.stderr)
         return 1
     return 0
+
+
+def main() -> int:
+    os.umask(0o077)
+    config = xdg_path("XDG_CONFIG_HOME", ".config") / "omarchy-calendar" / "vdirsyncer.conf"
+    state = xdg_path("XDG_STATE_HOME", ".local/state") / "omarchy-calendar"
+    status_path = state / "sync-status.json"
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(state, 0o700)
+    lock_path = state / "operation.lock"
+    with lock_path.open("a+b") as lock_stream:
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            status = {
+                "attempted": False,
+                "ok": False,
+                "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "error": "another account setup or synchronization is already running",
+            }
+            write_status(status_path, status)
+            print(status["error"], file=sys.stderr)
+            return 1
+        return run_sync(config, status_path)
 
 
 if __name__ == "__main__":

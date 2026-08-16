@@ -454,6 +454,83 @@ function durableSetupFields(input) {
   return value
 }
 
+function validHttpsAuthority(value) {
+  var match = /^https:\/\/([^\/?#]+)(?:[\/?][^#]*)?$/.exec(String(value || ""))
+  if (!match || /[@\s\\<>"'{}|^`]/.test(match[1]) || /%(?![0-9A-Fa-f]{2})/.test(value)) return false
+  var authority = match[1]
+  var host = authority
+  var port = ""
+  if (authority.charAt(0) === "[") {
+    var closing = authority.indexOf("]")
+    if (closing <= 1 || !/^[0-9A-Fa-f:.%]+$/.test(authority.substring(1, closing))) return false
+    var remainder = authority.substring(closing + 1)
+    if (remainder !== "" && remainder.charAt(0) !== ":") return false
+    port = remainder.substring(1)
+  } else {
+    var separator = authority.lastIndexOf(":")
+    if (separator !== -1) {
+      if (authority.indexOf(":") !== separator) return false
+      host = authority.substring(0, separator)
+      port = authority.substring(separator + 1)
+    }
+    if (host === "" || !/^[A-Za-z0-9._~-]+$/.test(host)) return false
+  }
+  if (port !== "" && (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535)) return false
+  return authority.charAt(authority.length - 1) !== ":"
+}
+
+function isHttpsCaldavUrl(value) {
+  var text = String(value || "")
+  return text === text.replace(/^\s+|\s+$/g, "") && text.indexOf("#") === -1
+    && !/[\x00-\x20]/.test(text) && validHttpsAuthority(text)
+}
+
+function isGoogleAuthorizationUrl(value) {
+  var text = String(value || "")
+  var match = /^https:\/\/accounts\.google\.com(?::(\d+))?\/o\/oauth2\/(?:v2\/)?auth\?[^\s#]+$/.exec(text)
+  return !!match && (match[1] === undefined || match[1] === "443")
+    && text.length <= 8192 && !/%(?![0-9A-Fa-f]{2})/.test(text)
+}
+
+function parseSetupProtocolLine(line, requestId, state) {
+  var current = state && typeof state === "object" ? state : {}
+  var response = null
+  try { response = JSON.parse(String(line || "")) }
+  catch (error) { return { valid: false, error: "Calendar setup returned invalid progress data" } }
+  if (!response || typeof response !== "object" || Array.isArray(response)
+      || String(response.requestId || "") !== String(requestId || ""))
+    return { valid: false, error: "Calendar setup response did not match its request" }
+  if (current.finalSeen === true)
+    return { valid: false, error: "Calendar setup returned an invalid message sequence" }
+  if (response.type === "progress" && typeof response.stage === "string" && typeof response.message === "string")
+    return { valid: true, kind: "progress", response: response, state: current }
+  if (response.type === "browser" && current.browserSeen !== true && isGoogleAuthorizationUrl(response.url))
+    return { valid: true, kind: "browser", response: response, state: { browserSeen: true, finalSeen: false } }
+  if (response.type === "result" && response.final === true && typeof response.ok === "boolean")
+    return {
+      valid: true,
+      kind: "result",
+      response: response,
+      state: { browserSeen: current.browserSeen === true, finalSeen: true }
+    }
+  return { valid: false, error: "Calendar setup returned an invalid message sequence" }
+}
+
+function setupResultPresentation(finalResponse, locallyCancelled) {
+  if (finalResponse && finalResponse.ok === true) {
+    return {
+      state: "success",
+      message: finalResponse.replacesExisting === true
+        ? "Calendar account replaced successfully" : "Calendar account connected successfully",
+      warning: finalResponse.cleanupComplete === false
+        ? "Account connected, but an old credential or token could not be removed." : ""
+    }
+  }
+  if (locallyCancelled === true)
+    return { state: "cancelled", message: "Account setup cancelled", warning: "" }
+  return null
+}
+
 function validateSetupInput(input) {
   var source = input && typeof input === "object" ? input : {}
   var value = durableSetupFields(source)
@@ -476,9 +553,8 @@ function validateSetupInput(input) {
       return invalidInput("username", "Username is too long or contains a line break")
     if (value.provider === "caldav") {
       var rawUrl = String(source.url === undefined || source.url === null ? "" : source.url)
-      var authority = /^https?:\/\/([^\/?#]+)(?:[\/?#]|$)/i.exec(value.url)
-      if (!authority || authority[1].indexOf("@") !== -1 || /\s/.test(authority[1]))
-        return invalidInput("url", "Use an HTTP(S) CalDAV URL without embedded credentials")
+      if (!isHttpsCaldavUrl(value.url))
+        return invalidInput("url", "Use an HTTPS CalDAV URL without credentials or a fragment")
       if (utf8Length(rawUrl.replace(/^\s+|\s+$/g, "")) > 4096 || /[\x00\r\n]/.test(rawUrl))
         return invalidInput("url", "CalDAV URL is too long or contains a line break")
     }
@@ -563,6 +639,10 @@ if (typeof module !== "undefined") {
     upcomingEvents: upcomingEvents,
     militaryTime: militaryTime,
     durableSetupFields: durableSetupFields,
+    isHttpsCaldavUrl: isHttpsCaldavUrl,
+    isGoogleAuthorizationUrl: isGoogleAuthorizationUrl,
+    parseSetupProtocolLine: parseSetupProtocolLine,
+    setupResultPresentation: setupResultPresentation,
     validateSetupInput: validateSetupInput,
     validateCreateInput: validateCreateInput,
     localPathForUrl: localPathForUrl,

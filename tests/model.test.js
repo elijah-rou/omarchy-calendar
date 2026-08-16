@@ -81,11 +81,26 @@ function testSetupValidation() {
   assert.equal(Model.validateSetupInput({ provider: 'google', clientId: '', secret: 'x' }).field, 'clientId')
   assert.equal(Model.validateSetupInput({ provider: 'icloud', username: '', secret: 'x' }).field, 'username')
   assert.equal(Model.validateSetupInput({
+    provider: 'caldav', username: 'me', url: 'http://example.com', secret: 'x'
+  }).field, 'url')
+  assert.equal(Model.validateSetupInput({
     provider: 'caldav', username: 'me', url: 'ftp://example.com', secret: 'x'
   }).field, 'url')
   assert.equal(Model.validateSetupInput({
     provider: 'caldav', username: 'me', url: 'https://me:secret@example.com/dav', secret: 'x'
   }).field, 'url')
+  assert.equal(Model.validateSetupInput({
+    provider: 'caldav', username: 'me', url: 'https://example.com/dav#calendar', secret: 'x'
+  }).field, 'url')
+  assert.equal(Model.validateSetupInput({
+    provider: 'caldav', username: 'me', url: 'https://example.com:bad/dav', secret: 'x'
+  }).field, 'url')
+  assert.equal(Model.validateSetupInput({
+    provider: 'caldav', username: 'me', url: 'https://calendar.lan:8443/dav', secret: 'x'
+  }).valid, true)
+  assert.equal(Model.validateSetupInput({
+    provider: 'caldav', username: 'me', url: 'https://[fd00::1]/dav', secret: 'x'
+  }).valid, true)
   assert.equal(Model.validateSetupInput({
     provider: 'caldav', username: 'me', url: 'https://example.com/dav', secret: ''
   }).field, 'secret')
@@ -105,6 +120,37 @@ function testSetupValidation() {
     provider: 'caldav', displayName: 'Work', username: 'me', url: 'https://example.com/dav'
   })
   assert.equal(JSON.stringify(durable).includes('never-store'), false)
+}
+
+function testSetupProtocolLifecycle() {
+  const state = { browserSeen: false, finalSeen: false }
+  const malformed = Model.parseSetupProtocolLine('{bad', 'request-1', state)
+  assert.equal(malformed.valid, false)
+
+  const browserLine = JSON.stringify({
+    type: 'browser', requestId: 'request-1',
+    url: 'https://accounts.google.com/o/oauth2/auth?client_id=desktop'
+  })
+  const browser = Model.parseSetupProtocolLine(browserLine, 'request-1', state)
+  assert.equal(browser.valid, true)
+  assert.equal(browser.kind, 'browser')
+  assert.equal(Model.parseSetupProtocolLine(browserLine, 'request-1', browser.state).valid, false)
+  assert.equal(Model.parseSetupProtocolLine(JSON.stringify({
+    type: 'browser', requestId: 'request-1', url: 'https://evil.example/auth'
+  }), 'request-1', state).valid, false)
+
+  const finalLine = JSON.stringify({ type: 'result', final: true, ok: true, requestId: 'request-1' })
+  const final = Model.parseSetupProtocolLine(finalLine, 'request-1', browser.state)
+  assert.equal(final.valid, true)
+  assert.equal(Model.parseSetupProtocolLine(finalLine, 'request-1', final.state).valid, false)
+
+  const committedAfterCancel = Model.setupResultPresentation({
+    ok: true, replacesExisting: true, cleanupComplete: false
+  }, true)
+  assert.equal(committedAfterCancel.state, 'success')
+  assert.equal(committedAfterCancel.message, 'Calendar account replaced successfully')
+  assert.match(committedAfterCancel.warning, /old credential or token/)
+  assert.equal(Model.setupResultPresentation(null, true).state, 'cancelled')
 }
 
 function testCreateValidation() {
@@ -140,5 +186,6 @@ function testCreateValidation() {
 testEventNormalization()
 testDateMapping()
 testSetupValidation()
+testSetupProtocolLifecycle()
 testCreateValidation()
 console.log('Model.js tests passed')

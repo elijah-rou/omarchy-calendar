@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import json
 import os
 import selectors
@@ -23,7 +24,7 @@ MAX_EVENTS = 256
 MAX_RANGE_DAYS = 366
 COMMAND_TIMEOUT_SECONDS = 30
 SYNC_TIMEOUT_SECONDS = 300
-ACTIVE_PROCESS: subprocess.Popen[bytes] | None = None
+active_process: subprocess.Popen[bytes] | None = None
 JSON_FIELDS = (
     "uid",
     "title",
@@ -70,6 +71,7 @@ def paths() -> dict[str, Path]:
         "vdirsyncer_config": config / "vdirsyncer.conf",
         "remote_profile": config / "remote-profile.json",
         "sync_status": state / "sync-status.json",
+        "operation_lock": state / "operation.lock",
     }
 
 
@@ -153,14 +155,14 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def handle_termination(signum: int, _frame: Any) -> None:
-    process = ACTIVE_PROCESS
+    process = active_process
     if process is not None:
         terminate_process_group(process)
     raise SystemExit(128 + signum)
 
 
 def run_command(argv: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
-    global ACTIVE_PROCESS
+    global active_process
     assert argv
     assert timeout > 0
     try:
@@ -175,7 +177,7 @@ def run_command(argv: list[str], timeout: int) -> subprocess.CompletedProcess[st
     except OSError as error:
         raise CommandError(Path(argv[0]).name, str(error)) from error
 
-    ACTIVE_PROCESS = process
+    active_process = process
     assert process.stdout is not None
     assert process.stderr is not None
     stdout_buffer = bytearray()
@@ -205,7 +207,7 @@ def run_command(argv: list[str], timeout: int) -> subprocess.CompletedProcess[st
         streams.close()
         if process.poll() is None:
             terminate_process_group(process)
-        ACTIVE_PROCESS = None
+        active_process = None
 
     stdout = stdout_buffer.decode("utf-8", errors="replace")
     stderr = stderr_buffer.decode("utf-8", errors="replace")
@@ -313,18 +315,34 @@ def request_list(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_sync() -> dict[str, Any]:
-    configured = paths()["vdirsyncer_config"].is_file()
+    current_paths = paths()
+    configured = current_paths["vdirsyncer_config"].is_file()
     if not configured:
         return {"attempted": False, "ok": True}
     started = dt.datetime.now(dt.timezone.utc)
-    try:
-        argv = command_argv("vdirsyncer", "-c", str(paths()["vdirsyncer_config"]), "sync")
-        run_command(argv, SYNC_TIMEOUT_SECONDS)
-        sync = {"attempted": True, "ok": True, "at": started.isoformat()}
-    except CommandError as error:
-        sync = {"attempted": True, "ok": False, "at": started.isoformat(), "error": error.message}
-    write_sync_status(sync)
-    return sync
+    lock_path = current_paths["operation_lock"]
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_stream:
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sync = {
+                "attempted": False,
+                "ok": False,
+                "at": started.isoformat(),
+                "error": "another account setup or synchronization is already running",
+            }
+            write_sync_status(sync)
+            return sync
+        try:
+            argv = command_argv("vdirsyncer", "-c", str(current_paths["vdirsyncer_config"]), "sync")
+            run_command(argv, SYNC_TIMEOUT_SECONDS)
+            sync = {"attempted": True, "ok": True, "at": started.isoformat()}
+        except CommandError as error:
+            sync = {"attempted": True, "ok": False, "at": started.isoformat(), "error": error.message}
+        write_sync_status(sync)
+        return sync
 
 
 def write_sync_status(status: dict[str, Any]) -> None:
@@ -424,7 +442,8 @@ def executable_version(name: str) -> str | None:
 
 def read_remote_profile(path: Path) -> tuple[str | None, str | None]:
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as stream:
+            raw = stream.read(16 * 1024 + 1)
         if len(raw) > 16 * 1024:
             return None, None
         profile = json.loads(raw)
@@ -446,7 +465,8 @@ def request_status(request: dict[str, Any]) -> dict[str, Any]:
     current_paths = paths()
     last_sync: dict[str, Any] | None = None
     try:
-        raw = current_paths["sync_status"].read_bytes()
+        with current_paths["sync_status"].open("rb") as stream:
+            raw = stream.read(16 * 1024 + 1)
         if len(raw) <= 16 * 1024:
             candidate = json.loads(raw)
             if isinstance(candidate, dict):

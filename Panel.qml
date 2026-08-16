@@ -44,8 +44,11 @@ Panel {
   property string formError: ""
   property bool addingAccount: false
   property string setupState: "idle"
+  property string setupStage: ""
   property string setupMessage: ""
   property string setupError: ""
+  property string setupWarning: ""
+  property string setupBrowserUrl: ""
   property bool setupCancelled: false
   property bool setupTimedOut: false
   property bool setupProtocolError: false
@@ -85,6 +88,10 @@ Panel {
   }
 
   function close() {
+    if (root.setupBusy) {
+      root.cancelAccountSetup()
+      return
+    }
     root.setCenterHoverRevealSuppressed(false)
     root.cancelAdd()
     root.closeSetupForm()
@@ -387,8 +394,11 @@ Panel {
     root.cancelAdd()
     root.addingAccount = true
     root.setupState = "idle"
+    root.setupStage = ""
     root.setupMessage = ""
     root.setupError = ""
+    root.setupWarning = ""
+    root.setupBrowserUrl = ""
     root.setupReplacesExisting = root.remoteAccount.setupMode === "replace"
     setupProvider.value = "google"
     setupDisplayName.text = ""
@@ -409,8 +419,11 @@ Panel {
     root.clearSetupSecret()
     root.addingAccount = false
     root.setupState = "idle"
+    root.setupStage = ""
     root.setupMessage = ""
     root.setupError = ""
+    root.setupWarning = ""
+    root.setupBrowserUrl = ""
     if (setupProvider.popupOpen) setupProvider.close()
     Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
   }
@@ -418,8 +431,11 @@ Panel {
   function resetSetupFeedback() {
     if (root.setupBusy) return
     root.setupState = "idle"
+    root.setupStage = ""
     root.setupMessage = ""
     root.setupError = ""
+    root.setupWarning = ""
+    root.setupBrowserUrl = ""
   }
 
   function submitAccountSetup() {
@@ -451,8 +467,11 @@ Panel {
     setupProcess.requestText = JSON.stringify(checked.value)
     checked.value.secret = ""
     root.setupState = "running"
+    root.setupStage = "starting"
     root.setupMessage = "Starting account setup…"
     root.setupError = ""
+    root.setupWarning = ""
+    root.setupBrowserUrl = ""
     root.setupCancelled = false
     root.setupTimedOut = false
     root.setupProtocolError = false
@@ -464,6 +483,13 @@ Panel {
     setupProcess.running = true
   }
 
+  function failSetupProtocol(message) {
+    root.setupProtocolError = true
+    root.setupError = message
+    if (setupProcess.running) setupProcess.signal(15)
+    setupHardKill.restart()
+  }
+
   function acceptSetupLine(data) {
     if (!root.setupBusy || root.setupProtocolError) return
     var line = String(data || "")
@@ -472,46 +498,36 @@ Panel {
     if (line.length === 0 || line.length > 16384
         || root.setupResponseCharacters > root.maxSetupResponseCharacters
         || root.setupResponseLines > root.maxSetupResponseLines) {
-      root.setupProtocolError = true
-      root.setupError = "Calendar setup returned too much data"
-      if (setupProcess.running) setupProcess.signal(15)
-      setupHardKill.restart()
+      root.failSetupProtocol("Calendar setup returned too much data")
       return
     }
-    var response = null
-    try { response = JSON.parse(line) }
-    catch (error) {
-      root.setupProtocolError = true
-      root.setupError = "Calendar setup returned invalid progress data"
-      if (setupProcess.running) setupProcess.signal(15)
-      setupHardKill.restart()
+    var parsed = Model.parseSetupProtocolLine(line, root.activeSetupRequestId, {
+      browserSeen: root.setupBrowserUrl !== "",
+      finalSeen: root.setupFinalResponse !== null
+    })
+    if (!parsed.valid) {
+      root.failSetupProtocol(parsed.error || "Calendar setup returned invalid data")
       return
     }
-    if (!response || typeof response !== "object" || Array.isArray(response)
-        || String(response.requestId || "") !== root.activeSetupRequestId) {
-      root.setupProtocolError = true
-      root.setupError = "Calendar setup response did not match its request"
-      if (setupProcess.running) setupProcess.signal(15)
-      setupHardKill.restart()
-      return
-    }
-    if (response.type === "progress" && root.setupFinalResponse === null) {
+    var response = parsed.response
+    if (parsed.kind === "progress") {
+      root.setupStage = String(response.stage || "").substr(0, 32)
       root.setupMessage = String(response.message || "Working…").substr(0, 500)
       if (response.replacesExisting === true) root.setupReplacesExisting = true
-    } else if (response.type === "result" && response.final === true && root.setupFinalResponse === null) {
+    } else if (parsed.kind === "browser") {
+      root.setupBrowserUrl = String(response.url)
+      root.setupMessage = "Complete authorization in your browser"
+      Qt.openUrlExternally(root.setupBrowserUrl)
+    } else if (parsed.kind === "result") {
       root.setupFinalResponse = {
         ok: response.ok === true,
         replacesExisting: response.replacesExisting === true,
+        cleanupComplete: response.cleanupComplete !== false,
         errorMessage: response.error && response.error.message
           ? String(response.error.message).substr(0, 500) : ""
       }
       if (response.replacesExisting === true) root.setupReplacesExisting = true
       root.setupMessage = response.ok === true ? "Finishing setup…" : ""
-    } else {
-      root.setupProtocolError = true
-      root.setupError = "Calendar setup returned an invalid message sequence"
-      if (setupProcess.running) setupProcess.signal(15)
-      setupHardKill.restart()
     }
   }
 
@@ -520,7 +536,7 @@ Panel {
       root.closeSetupForm()
       return
     }
-    if (!setupProcess.running) return
+    if (!setupProcess.running || root.setupStage === "committing" || root.setupState === "cancelling") return
     root.setupCancelled = true
     root.setupState = "cancelling"
     root.setupMessage = "Cancelling account setup…"
@@ -535,10 +551,19 @@ Panel {
     var finalResponse = root.setupFinalResponse
     root.setupFinalResponse = null
 
-    if (root.setupCancelled) {
-      root.setupState = "cancelled"
-      root.setupMessage = "Account setup cancelled"
+    if (root.setupProtocolError) {
+      root.setupState = "error"
+      root.setupMessage = ""
+      if (root.setupError === "") root.setupError = "Calendar setup returned invalid data"
+      return
+    }
+    var presentation = Model.setupResultPresentation(finalResponse, root.setupCancelled)
+    if (presentation !== null) {
+      root.setupState = presentation.state
+      root.setupMessage = presentation.message
+      root.setupWarning = presentation.warning
       root.setupError = ""
+      if (presentation.state === "success") root.refreshData(true)
       return
     }
     if (root.setupTimedOut) {
@@ -547,31 +572,15 @@ Panel {
       root.setupError = "Account setup timed out after 11 minutes"
       return
     }
-    if (root.setupProtocolError) {
-      root.setupState = "error"
-      root.setupMessage = ""
-      if (root.setupError === "") root.setupError = "Calendar setup returned invalid data"
-      return
-    }
     if (exitCode !== 0 || finalResponse === null) {
       root.setupState = "error"
       root.setupMessage = ""
       root.setupError = exitCode !== 0 ? "Calendar setup helper failed" : "Calendar setup ended without a result"
       return
     }
-    if (finalResponse.ok !== true) {
-      root.setupState = "error"
-      root.setupMessage = ""
-      root.setupError = finalResponse.errorMessage || "Account setup failed"
-      return
-    }
-
-    root.setupState = "success"
-    root.setupError = ""
-    root.setupMessage = finalResponse.replacesExisting === true
-      ? "Calendar account replaced successfully"
-      : "Calendar account connected successfully"
-    root.refreshData(true)
+    root.setupState = "error"
+    root.setupMessage = ""
+    root.setupError = finalResponse.errorMessage || "Account setup failed"
   }
 
   function eventTime(event) {
@@ -666,7 +675,7 @@ Panel {
 
   Timer {
     id: setupHardKill
-    interval: 2000
+    interval: 30000
     repeat: false
     onTriggered: if (setupProcess.running) setupProcess.signal(9)
   }
@@ -971,7 +980,7 @@ Panel {
             anchors.horizontalCenter: parent.horizontalCenter
             spacing: Style.space(7)
             Keys.onEscapePressed: {
-              if (root.setupBusy) root.close()
+              if (root.setupBusy) root.cancelAccountSetup()
               else root.closeSetupForm()
             }
 
@@ -1098,6 +1107,26 @@ Panel {
               font.pixelSize: Style.font.bodySmall
             }
             Text {
+              visible: root.setupBrowserUrl !== ""
+              width: parent.width
+              text: root.setupBrowserUrl
+              wrapMode: Text.WrapAnywhere
+              textFormat: Text.PlainText
+              color: Color.accent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              visible: root.setupWarning !== ""
+              width: parent.width
+              text: root.setupWarning
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              color: Color.urgent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
               visible: root.setupError !== ""
               width: parent.width
               text: root.setupError
@@ -1111,10 +1140,13 @@ Panel {
               anchors.right: parent.right
               spacing: Style.space(6)
               Button {
-                text: root.setupBusy ? "Cancel setup" : "Close"
+                text: root.setupBusy
+                  ? (root.setupStage === "committing" ? "Activating…" : "Cancel setup")
+                  : "Close"
                 foreground: root.contentForeground
                 fontFamily: root.contentFontFamily
                 focusable: true
+                enabled: !root.setupBusy || root.setupStage !== "committing"
                 onClicked: {
                   if (root.setupBusy) root.cancelAccountSetup()
                   else root.closeSetupForm()

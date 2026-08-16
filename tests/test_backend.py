@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "bin" / "omarchy-calendar"
@@ -41,6 +45,10 @@ class IsolatedEnvironment(unittest.TestCase):
                 "PATH": f"{self.bin}:{self.env.get('PATH', '')}",
                 "COMMAND_LOG": str(root / "commands.log"),
                 "SECRET_INPUT_LOG": str(root / "secret-input.log"),
+                "KEYRING_PATH": str(root / "keyring.json"),
+                "SETUP_MARKER": str(root / "setup.marker"),
+                "CHILD_MARKER": str(root / "child.marker"),
+                "CLEAR_MARKER": str(root / "clear.marker"),
             }
         )
         Path(self.env["HOME"]).mkdir()
@@ -104,44 +112,80 @@ elif os.environ.get("FAIL_SYNC") == "1" and "sync" in args:
     raise SystemExit(4)
 '''
 
-FAKE_SECRET_TOOL_SETUP = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys
+STATEFUL_SECRET_TOOL_SETUP = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys, time
 args = sys.argv[1:]
 with pathlib.Path(os.environ["COMMAND_LOG"]).open("a") as stream:
     stream.write("secret-tool " + json.dumps(args) + "\n")
+keyring_path = pathlib.Path(os.environ["KEYRING_PATH"])
+try:
+    keyring = json.loads(keyring_path.read_text())
+except (FileNotFoundError, json.JSONDecodeError):
+    keyring = {}
 if args and args[0] == "store":
-    secret = sys.stdin.read()
+    secret_value = sys.stdin.read()
     with pathlib.Path(os.environ["SECRET_INPUT_LOG"]).open("a") as stream:
-        stream.write(secret)
+        stream.write(secret_value)
     if os.environ.get("FAIL_SECRET_STORE") == "1":
-        print(secret, file=sys.stderr)
         raise SystemExit(3)
+    attributes = args[2:]
+    keyring[json.dumps(attributes, separators=(",", ":"))] = secret_value
+    keyring_path.write_text(json.dumps(keyring, separators=(",", ":")))
 elif args and args[0] == "lookup":
-    print("stored-secret")
+    value = keyring.get(json.dumps(args[1:], separators=(",", ":")))
+    if value is None:
+        raise SystemExit(1)
+    sys.stdout.write(value)
 elif args and args[0] == "clear":
-    pass
+    pathlib.Path(os.environ["CLEAR_MARKER"]).write_text(str(os.getpid()))
+    if os.environ.get("BLOCK_CLEAR") == "1":
+        time.sleep(60)
+    if os.environ.get("FAIL_SECRET_CLEAR") == "1":
+        raise SystemExit(4)
+    keyring.pop(json.dumps(args[1:], separators=(",", ":")), None)
+    keyring_path.write_text(json.dumps(keyring, separators=(",", ":")))
 else:
     raise SystemExit(2)
 '''
 
-FAKE_VDIRSYNCER_SETUP = r'''#!/usr/bin/env python3
-import json, os, pathlib, re, sys
+ADVANCED_VDIRSYNCER_SETUP = r'''#!/usr/bin/env python3
+import json, os, pathlib, re, subprocess, sys, time
 args = sys.argv[1:]
 with pathlib.Path(os.environ["COMMAND_LOG"]).open("a") as stream:
     stream.write("vdirsyncer " + json.dumps(args) + "\n")
 config = pathlib.Path(args[args.index("-c") + 1])
 content = config.read_text()
-if os.environ.get("FAIL_SETUP") == args[-1]:
-    print("super-secret-value: remote rejected setup", file=sys.stderr)
+phase = args[-1]
+if os.environ.get("BLOCK_SETUP") == phase:
+    if os.environ.get("SPAWN_TERM_IGNORING_CHILD") == "1":
+        child_code = (
+            "import os,pathlib,signal,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "pathlib.Path(os.environ['CHILD_MARKER']).write_text(str(os.getpid()));"
+            "time.sleep(60)"
+        )
+        subprocess.Popen([sys.executable, "-c", child_code])
+    pathlib.Path(os.environ["SETUP_MARKER"]).write_text(str(os.getpid()))
+    time.sleep(60)
+if os.environ.get("FAIL_SETUP") == phase:
+    print("remote rejected setup", file=sys.stderr)
     raise SystemExit(130 if os.environ.get("CANCEL_SETUP") == "1" else 7)
 path_match = re.search(r'^path = (".*")$', content, re.MULTILINE)
 if path_match:
     synced = pathlib.Path(json.loads(path_match.group(1)))
     synced.mkdir(parents=True, exist_ok=True)
-    if args[-1] == "sync":
-        (synced / "remote.ics").write_text("candidate")
+    if phase == "sync":
+        candidate = synced / "remote.ics"
+        if os.environ.get("OVERSIZE_CANDIDATE") == "1":
+            with candidate.open("wb") as stream:
+                stream.truncate(256 * 1024 * 1024 + 1)
+        else:
+            candidate.write_text("candidate")
 token_match = re.search(r'^token_file = (".*")$', content, re.MULTILINE)
-if token_match and args[-1] == "discover":
+if token_match and phase == "discover":
+    if os.environ.get("EMIT_GOOGLE_URL") == "1":
+        print("diagnostic that must not be forwarded", flush=True)
+        print("https://accounts.google.com/o/oauth2/auth?client_id=desktop&scope=calendar", flush=True)
     token = pathlib.Path(json.loads(token_match.group(1)))
     token.write_text(json.dumps({"token": config.parent.name}))
 '''
@@ -257,7 +301,7 @@ class BackendProtocolTests(IsolatedEnvironment):
         assert spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        module.MAX_RESPONSE_BYTES = 128
+        module.MAX_RESPONSE_BYTES = 128  # pyright: ignore[reportAttributeAccessIssue]
         encoded = module.encode_response({"ok": True, "requestId": "large-id", "events": ["x" * 512]})
         response = json.loads(encoded)
         self.assertFalse(response["ok"])
@@ -428,8 +472,8 @@ class SetupTests(IsolatedEnvironment):
 class WidgetSetupRequestTests(IsolatedEnvironment):
     def setUp(self) -> None:
         super().setUp()
-        self.write_command("secret-tool", FAKE_SECRET_TOOL_SETUP)
-        self.write_command("vdirsyncer", FAKE_VDIRSYNCER_SETUP)
+        self.write_command("secret-tool", STATEFUL_SECRET_TOOL_SETUP)
+        self.write_command("vdirsyncer", ADVANCED_VDIRSYNCER_SETUP)
 
     def run_setup_request(
         self, request: object | None = None, *, raw: bytes | None = None
@@ -448,6 +492,43 @@ class WidgetSetupRequestTests(IsolatedEnvironment):
         self.assertEqual(sum(line.get("final") is True for line in lines), 1)
         self.assertTrue(lines[-1]["final"])
         return result, lines
+
+    def start_setup_request(self, request: dict[str, Any]) -> subprocess.Popen[bytes]:
+        process = subprocess.Popen(
+            [str(SETUP_REQUEST)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env,
+        )
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(request).encode() + b"\n")
+        process.stdin.close()
+        return process
+
+    def finish_setup_process(self, process: subprocess.Popen[bytes], timeout: float = 15) -> list[dict[str, Any]]:
+        process.wait(timeout=timeout)
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stdout = process.stdout.read()
+        stderr = process.stderr.read()
+        process.stdout.close()
+        process.stderr.close()
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(stderr, b"")
+        lines = [json.loads(line) for line in stdout.splitlines()]
+        self.assertEqual(sum(line.get("final") is True for line in lines), 1)
+        return lines
+
+    def wait_for_file(self, path: Path, timeout: float = 10) -> None:
+        deadline = time.monotonic() + timeout
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(path.exists(), f"timed out waiting for {path}")
+
+    def keyring(self) -> dict[str, str]:
+        path = Path(self.env["KEYRING_PATH"])
+        return json.loads(path.read_text()) if path.exists() else {}
 
     def test_caldav_stores_stdin_secret_and_emits_progress_then_one_final(self) -> None:
         secret = "super-secret-value"
@@ -484,6 +565,290 @@ class WidgetSetupRequestTests(IsolatedEnvironment):
             "setupMode": "replace",
             "singleProfile": True,
         })
+
+    def test_keyring_attributes_are_exact_namespaced_and_stateful(self) -> None:
+        request = {
+            "requestId": "exact-one",
+            "provider": "caldav",
+            "username": "person@example.test",
+            "url": "https://calendar.example.test/dav/",
+            "secret": "first-value",
+        }
+        _, first = self.run_setup_request(request)
+        self.assertTrue(first[-1]["ok"])
+        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
+        profile = json.loads((config_root / "remote-profile.json").read_text())
+        account_id = hashlib.sha256(
+            b"caldav\nperson@example.test\nhttps://calendar.example.test/dav/"
+        ).hexdigest()[:32]
+        namespace = hashlib.sha256("\n".join((
+            str(config_root),
+            str(Path(self.env["XDG_DATA_HOME"]) / "omarchy-calendar"),
+            str(Path(self.env["XDG_STATE_HOME"]) / "omarchy-calendar"),
+        )).encode()).hexdigest()[:32]
+        attributes = [
+            "service", "omarchy-calendar",
+            "purpose", "remote-credential",
+            "installation", namespace,
+            "provider", "caldav",
+            "account", account_id,
+            "slot", profile["credentialSlot"],
+        ]
+        commands = [
+            json.loads(line.removeprefix("secret-tool "))
+            for line in Path(self.env["COMMAND_LOG"]).read_text().splitlines()
+            if line.startswith("secret-tool ")
+        ]
+        self.assertEqual(commands[0], ["store", "--label=Omarchy Calendar remote credential", *attributes])
+        config = (config_root / "vdirsyncer.conf").read_text()
+        self.assertIn(json.dumps(["command", "secret-tool", "lookup", *attributes]), config)
+        self.assertEqual(self.keyring(), {json.dumps(attributes, separators=(",", ":")): "first-value"})
+
+        request["requestId"] = "exact-two"
+        request["secret"] = "second-value"
+        _, second = self.run_setup_request(request)
+        self.assertTrue(second[-1]["ok"])
+        updated_profile = json.loads((config_root / "remote-profile.json").read_text())
+        updated_attributes = [*attributes[:-1], updated_profile["credentialSlot"]]
+        commands = [
+            json.loads(line.removeprefix("secret-tool "))
+            for line in Path(self.env["COMMAND_LOG"]).read_text().splitlines()
+            if line.startswith("secret-tool ")
+        ]
+        self.assertEqual(commands[-1], ["clear", *attributes])
+        self.assertEqual(self.keyring(), {
+            json.dumps(updated_attributes, separators=(",", ":")): "second-value"
+        })
+
+    def test_missing_profile_failed_same_account_replacement_preserves_active_credential(self) -> None:
+        request = {
+            "requestId": "active",
+            "provider": "caldav",
+            "username": "same@example.test",
+            "url": "https://same.example.test/dav",
+            "secret": "active-value",
+        }
+        _, first = self.run_setup_request(request)
+        self.assertTrue(first[-1]["ok"])
+        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
+        config_path = config_root / "vdirsyncer.conf"
+        before_config = config_path.read_bytes()
+        before_keyring = self.keyring()
+        (config_root / "remote-profile.json").unlink()
+
+        self.env["FAIL_SETUP"] = "sync"
+        request["requestId"] = "failed-replacement"
+        request["secret"] = "candidate-value"
+        _, failed = self.run_setup_request(request)
+        self.assertFalse(failed[-1]["ok"])
+        self.assertEqual(config_path.read_bytes(), before_config)
+        self.assertEqual(self.keyring(), before_keyring)
+        clear_commands = [
+            json.loads(line.removeprefix("secret-tool "))
+            for line in Path(self.env["COMMAND_LOG"]).read_text().splitlines()
+            if line.startswith('secret-tool ["clear"')
+        ]
+        self.assertEqual(len(clear_commands), 1)
+        self.assertNotEqual(clear_commands[0][1:], json.loads(next(iter(before_keyring))))
+
+    def test_separate_xdg_installations_do_not_share_credentials(self) -> None:
+        request = {
+            "requestId": "root-one",
+            "provider": "icloud",
+            "username": "same@icloud.test",
+            "secret": "root-one-value",
+        }
+        _, first = self.run_setup_request(request)
+        self.assertTrue(first[-1]["ok"])
+        second_env = self.env.copy()
+        root = Path(self.temporary.name) / "second-root"
+        for variable, name in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state")):
+            second_env[variable] = str(root / name)
+        request["requestId"] = "root-two"
+        request["secret"] = "root-two-value"
+        result = subprocess.run(
+            [str(SETUP_REQUEST)],
+            input=json.dumps(request).encode() + b"\n",
+            capture_output=True,
+            env=second_env,
+            timeout=10,
+            check=True,
+        )
+        self.assertTrue(json.loads(result.stdout.splitlines()[-1])["ok"])
+        keyring = self.keyring()
+        self.assertEqual(set(keyring.values()), {"root-one-value", "root-two-value"})
+        attributes = [json.loads(key) for key in keyring]
+        installation_values = [value[value.index("installation") + 1] for value in attributes]
+        self.assertEqual(len(set(installation_values)), 2)
+
+    def test_google_browser_event_is_validated_and_unrelated_output_is_not_forwarded(self) -> None:
+        self.env["EMIT_GOOGLE_URL"] = "1"
+        result, lines = self.run_setup_request({
+            "requestId": "google-browser",
+            "provider": "google",
+            "clientId": "desktop.apps.googleusercontent.com",
+            "secret": "oauth-secret",
+        })
+        browser = [line for line in lines if line.get("type") == "browser"]
+        self.assertEqual(len(browser), 1)
+        self.assertEqual(browser[0]["requestId"], "google-browser")
+        self.assertTrue(browser[0]["url"].startswith("https://accounts.google.com/"))
+        self.assertNotIn(b"diagnostic that must not be forwarded", result.stdout)
+
+    def test_oversize_candidate_fails_before_commit_and_clears_credential(self) -> None:
+        self.env["OVERSIZE_CANDIDATE"] = "1"
+        _, lines = self.run_setup_request({
+            "requestId": "oversize-candidate",
+            "provider": "caldav",
+            "username": "person@example.test",
+            "url": "https://calendar.example.test/dav",
+            "secret": "candidate-value",
+        })
+        self.assertFalse(lines[-1]["ok"])
+        self.assertEqual(lines[-1]["error"]["code"], "candidate_too_large")
+        self.assertEqual(self.keyring(), {})
+        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
+        self.assertFalse(config.exists())
+
+    def test_cleanup_failure_is_reported_without_reverting_commit(self) -> None:
+        base = {
+            "requestId": "cleanup-one",
+            "provider": "icloud",
+            "username": "first@icloud.test",
+            "secret": "first-value",
+        }
+        _, first = self.run_setup_request(base)
+        self.assertTrue(first[-1]["ok"])
+        self.env["FAIL_SECRET_CLEAR"] = "1"
+        replacement = {
+            "requestId": "cleanup-two",
+            "provider": "icloud",
+            "username": "second@icloud.test",
+            "secret": "second-value",
+        }
+        _, second = self.run_setup_request(replacement)
+        self.assertTrue(second[-1]["ok"])
+        self.assertFalse(second[-1]["cleanupComplete"])
+        profile = json.loads(
+            (Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "remote-profile.json").read_text()
+        )
+        self.assertEqual(profile["displayName"], "Icloud")
+
+    def test_cancellation_during_commit_rolls_back_active_state(self) -> None:
+        base = {
+            "requestId": "commit-base",
+            "provider": "caldav",
+            "username": "base@example.test",
+            "url": "https://base.example.test/dav",
+            "secret": "base-value",
+        }
+        _, first = self.run_setup_request(base)
+        self.assertTrue(first[-1]["ok"])
+        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
+        before = {
+            name: (config_root / name).read_bytes()
+            for name in ("vdirsyncer.conf", "khal.conf", "remote-profile.json")
+        }
+        before_keyring = self.keyring()
+
+        from backend import remote_setup
+
+        replacement = {
+            "requestId": "commit-cancel",
+            "provider": "caldav",
+            "username": "replacement@example.test",
+            "url": "https://replacement.example.test/dav",
+            "secret": "replacement-value",
+        }
+        validated, secret_buffer = remote_setup.validate_request(replacement)
+        real_atomic_write = remote_setup.atomic_write
+        cancellation_raised = False
+
+        def cancel_profile_write(path: Path, content: bytes, mode: int = 0o600) -> None:
+            nonlocal cancellation_raised
+            if path.name == "remote-profile.json" and not cancellation_raised:
+                cancellation_raised = True
+                raise remote_setup.SetupCancelled()
+            real_atomic_write(path, content, mode)
+
+        with (
+            mock.patch.dict(os.environ, self.env, clear=True),
+            mock.patch.object(remote_setup, "atomic_write", cancel_profile_write),
+            self.assertRaises(remote_setup.SetupCancelled),
+        ):
+            remote_setup.setup_remote(validated, secret_buffer, lambda *_args: None, lambda _url: None)
+        self.assertTrue(cancellation_raised)
+        for name, content in before.items():
+            self.assertEqual((config_root / name).read_bytes(), content)
+        self.assertEqual(self.keyring(), before_keyring)
+
+    def test_signal_after_commit_returns_success_and_marks_cleanup_incomplete(self) -> None:
+        _, first = self.run_setup_request({
+            "requestId": "signal-base",
+            "provider": "icloud",
+            "username": "base@icloud.test",
+            "secret": "base-value",
+        })
+        self.assertTrue(first[-1]["ok"])
+        Path(self.env["CLEAR_MARKER"]).unlink(missing_ok=True)
+        self.env["BLOCK_CLEAR"] = "1"
+        process = self.start_setup_request({
+            "requestId": "signal-replacement",
+            "provider": "icloud",
+            "username": "replacement@icloud.test",
+            "secret": "replacement-value",
+        })
+        self.wait_for_file(Path(self.env["CLEAR_MARKER"]))
+        process.send_signal(signal.SIGTERM)
+        lines = self.finish_setup_process(process)
+        self.assertTrue(lines[-1]["ok"])
+        self.assertFalse(lines[-1]["cleanupComplete"])
+        profile = json.loads(
+            (Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "remote-profile.json").read_text()
+        )
+        self.assertEqual(profile["accountId"], hashlib.sha256(b"icloud\nreplacement@icloud.test").hexdigest()[:32])
+
+    def test_real_sigterm_cleans_entire_process_group_and_rolls_back(self) -> None:
+        self.env["BLOCK_SETUP"] = "discover"
+        self.env["SPAWN_TERM_IGNORING_CHILD"] = "1"
+        process = self.start_setup_request({
+            "requestId": "process-tree",
+            "provider": "caldav",
+            "username": "person@example.test",
+            "url": "https://calendar.example.test/dav",
+            "secret": "candidate-value",
+        })
+        self.wait_for_file(Path(self.env["SETUP_MARKER"]))
+        self.wait_for_file(Path(self.env["CHILD_MARKER"]))
+        child_pid = int(Path(self.env["CHILD_MARKER"]).read_text())
+        process.send_signal(signal.SIGTERM)
+        lines = self.finish_setup_process(process, timeout=20)
+        self.assertFalse(lines[-1]["ok"])
+        self.assertEqual(lines[-1]["error"]["code"], "cancelled")
+        deadline = time.monotonic() + 5
+        while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(Path(f"/proc/{child_pid}").exists())
+        self.assertEqual(self.keyring(), {})
+
+    def test_setup_lock_excludes_scheduled_sync(self) -> None:
+        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
+        config_root.mkdir(parents=True)
+        (config_root / "vdirsyncer.conf").write_text("active")
+        self.env["BLOCK_SETUP"] = "discover"
+        process = self.start_setup_request({
+            "requestId": "lock-holder",
+            "provider": "caldav",
+            "username": "person@example.test",
+            "url": "https://calendar.example.test/dav",
+            "secret": "candidate-value",
+        })
+        self.wait_for_file(Path(self.env["SETUP_MARKER"]))
+        sync = subprocess.run([str(SYNC)], env=self.env, capture_output=True, timeout=10, check=False)
+        self.assertEqual(sync.returncode, 1)
+        self.assertIn(b"another account setup or synchronization", sync.stderr)
+        process.send_signal(signal.SIGTERM)
+        self.finish_setup_process(process, timeout=20)
 
     def test_failed_or_cancelled_setup_cleans_candidate_and_preserves_active_state(self) -> None:
         _, first_lines = self.run_setup_request({
@@ -571,6 +936,38 @@ class WidgetSetupRequestTests(IsolatedEnvironment):
             if line.startswith('secret-tool ["clear"')
         ]
         self.assertGreaterEqual(len(clear_lines), 2)
+
+    def test_caldav_requires_safe_https_but_allows_private_hosts(self) -> None:
+        invalid_urls = (
+            "http://calendar.example.test/dav",
+            "https://person:password@calendar.example.test/dav",
+            "https://calendar.example.test/dav#fragment",
+            "https://calendar.example.test:bad/dav",
+            "https://calendar.example.test/%zz",
+            " https://calendar.example.test/dav",
+            "https://calendar.example.test\\@evil.test/dav",
+        )
+        for index, url in enumerate(invalid_urls):
+            with self.subTest(url=url):
+                _, lines = self.run_setup_request({
+                    "requestId": f"invalid-url-{index}",
+                    "provider": "caldav",
+                    "username": "person@example.test",
+                    "url": url,
+                    "secret": "candidate-value",
+                })
+                self.assertFalse(lines[-1]["ok"])
+                self.assertEqual(lines[-1]["error"]["code"], "invalid_request")
+        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
+
+        _, private = self.run_setup_request({
+            "requestId": "private-url",
+            "provider": "caldav",
+            "username": "person@example.test",
+            "url": "https://calendar.lan:8443/dav",
+            "secret": "candidate-value",
+        })
+        self.assertTrue(private[-1]["ok"])
 
     def test_request_is_newline_delimited_bounded_and_provider_specific(self) -> None:
         _, no_newline = self.run_setup_request(raw=b'{"requestId":"x"}')
