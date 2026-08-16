@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Configure isolated local and synchronized calendar storage."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Sequence
+from pathlib import Path
+
+APP = "omarchy-calendar"
+TIMEOUT_SECONDS = 300
+
+
+def xdg_path(variable: str, fallback: str) -> Path:
+    value = os.environ.get(variable)
+    return Path(value).expanduser() if value else Path.home() / fallback
+
+
+def app_paths() -> dict[str, Path]:
+    return {
+        "config": xdg_path("XDG_CONFIG_HOME", ".config") / APP,
+        "data": xdg_path("XDG_DATA_HOME", ".local/share") / APP,
+        "state": xdg_path("XDG_STATE_HOME", ".local/state") / APP,
+    }
+
+
+def source_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def assert_outside_source(paths: dict[str, Path]) -> None:
+    root = source_root()
+    for name, path in paths.items():
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        raise SystemExit(f"refusing to write {name} inside the plugin source tree: {path}")
+
+
+def atomic_write(path: Path, content: str, mode: int) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, mode)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def quoted(value: str) -> str:
+    if not value or "\x00" in value or "\n" in value or "\r" in value:
+        raise SystemExit("configuration values must be non-empty single-line strings")
+    if len(value.encode("utf-8")) > 4096:
+        raise SystemExit("configuration value exceeds 4096 bytes")
+    return json.dumps(value, ensure_ascii=False)
+
+
+def fetch_value(command: str, arguments: Sequence[str]) -> str:
+    values = ["command", command, *arguments]
+    return json.dumps(values, ensure_ascii=False)
+
+
+def khal_config(paths: dict[str, Path], remote: bool) -> str:
+    local = paths["data"] / "calendars" / "local"
+    synced = paths["data"] / "calendars" / "synced" / "*"
+    remote_block = ""
+    if remote:
+        remote_block = f"\n[[synced]]\npath = {synced}\ntype = discover\n"
+    return f"""[calendars]
+[[local]]
+path = {local}
+type = calendar
+{remote_block}
+[locale]
+timeformat = %H:%M
+dateformat = %Y-%m-%d
+longdateformat = %Y-%m-%d
+datetimeformat = %Y-%m-%d %H:%M
+longdatetimeformat = %Y-%m-%d %H:%M
+
+[default]
+default_calendar = local
+highlight_event_days = true
+print_new = event
+"""
+
+
+def vdirsyncer_config(paths: dict[str, Path], remote_block: str) -> str:
+    status = paths["state"] / "vdirsyncer-status"
+    synced = paths["data"] / "calendars" / "synced"
+    return f"""[general]
+status_path = {quoted(str(status))}
+
+[pair omarchy_calendar]
+a = "omarchy_calendar_local"
+b = "omarchy_calendar_remote"
+collections = ["from a", "from b"]
+metadata = ["displayname", "color"]
+
+[storage omarchy_calendar_local]
+type = "filesystem"
+path = {quoted(str(synced))}
+fileext = ".ics"
+
+[storage omarchy_calendar_remote]
+{remote_block}
+"""
+
+
+def bootstrap(remote: bool) -> dict[str, Path]:
+    paths = app_paths()
+    assert_outside_source(paths)
+    remote_configured = (paths["config"] / "vdirsyncer.conf").is_file()
+    for directory in (
+        paths["config"],
+        paths["data"],
+        paths["state"],
+        paths["data"] / "calendars" / "local",
+        paths["data"] / "calendars" / "synced",
+    ):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+    atomic_write(paths["config"] / "khal.conf", khal_config(paths, remote or remote_configured), 0o600)
+    return paths
+
+
+def run(argv: list[str], timeout: int = TIMEOUT_SECONDS) -> None:
+    assert argv
+    executable = shutil.which(argv[0])
+    if executable is None:
+        raise SystemExit(f"required command is not installed: {argv[0]}")
+    argv[0] = executable
+    try:
+        subprocess.run(argv, stdin=subprocess.DEVNULL, timeout=timeout, check=True)
+    except subprocess.TimeoutExpired as error:
+        raise SystemExit(f"command timed out after {timeout} seconds: {Path(argv[0]).name}") from error
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"command failed with exit status {error.returncode}: {Path(argv[0]).name}") from error
+
+
+def configure_remote(remote_block: str, configure_only: bool) -> None:
+    paths = bootstrap(remote=True)
+    config_path = paths["config"] / "vdirsyncer.conf"
+    atomic_write(config_path, vdirsyncer_config(paths, remote_block), 0o600)
+    if not configure_only:
+        run(["vdirsyncer", "-c", str(config_path), "discover"])
+        run(["vdirsyncer", "-c", str(config_path), "sync"])
+    print(f"configured calendar data in {paths['data']}")
+    print(f"configuration: {paths['config']}")
+
+
+def command_local(_args: argparse.Namespace) -> None:
+    paths = bootstrap(remote=False)
+    print(f"initialized local calendar: {paths['data'] / 'calendars' / 'local'}")
+    print(f"configuration: {paths['config'] / 'khal.conf'}")
+
+
+def password_fetch(args: argparse.Namespace, option: str = "password") -> str:
+    command = getattr(args, f"{option}_command")
+    arguments = getattr(args, f"{option}_arg")
+    return fetch_value(command, arguments)
+
+
+def command_caldav(args: argparse.Namespace) -> None:
+    remote = "\n".join((
+        'type = "caldav"',
+        f"url = {quoted(args.url)}",
+        f"username = {quoted(args.username)}",
+        f"password.fetch = {password_fetch(args)}",
+    ))
+    configure_remote(remote, args.configure_only)
+
+
+def command_icloud(args: argparse.Namespace) -> None:
+    remote = "\n".join((
+        'type = "caldav"',
+        'url = "https://caldav.icloud.com/"',
+        f"username = {quoted(args.username)}",
+        f"password.fetch = {password_fetch(args)}",
+    ))
+    configure_remote(remote, args.configure_only)
+
+
+def command_google(args: argparse.Namespace) -> None:
+    remote = "\n".join((
+        'type = "google_calendar"',
+        f"token_file = {quoted(str(app_paths()['state'] / 'google-token.json'))}",
+        f"client_id = {quoted(args.client_id)}",
+        f"client_secret.fetch = {password_fetch(args, 'client_secret')}",
+    ))
+    configure_remote(remote, args.configure_only)
+
+
+def command_install_timer(_args: argparse.Namespace) -> None:
+    paths = app_paths()
+    assert_outside_source(paths)
+    local_bin = Path.home() / ".local" / "bin"
+    user_units = xdg_path("XDG_CONFIG_HOME", ".config") / "systemd" / "user"
+    local_bin.mkdir(mode=0o700, parents=True, exist_ok=True)
+    user_units.mkdir(mode=0o700, parents=True, exist_ok=True)
+    sync_source = source_root() / "bin" / "omarchy-calendar-sync"
+    if not sync_source.is_file():
+        raise SystemExit(f"sync command is missing: {sync_source}")
+    atomic_write(local_bin / "omarchy-calendar-sync", sync_source.read_text(encoding="utf-8"), 0o755)
+    for name in ("omarchy-calendar-sync.service", "omarchy-calendar-sync.timer"):
+        unit_source = source_root() / "systemd" / name
+        if not unit_source.is_file():
+            raise SystemExit(f"systemd unit is missing: {unit_source}")
+        atomic_write(user_units / name, unit_source.read_text(encoding="utf-8"), 0o644)
+    run(["systemctl", "--user", "daemon-reload"], timeout=30)
+    run(["systemctl", "--user", "enable", "--now", "omarchy-calendar-sync.timer"], timeout=30)
+    print("installed and enabled omarchy-calendar-sync.timer")
+
+
+def add_password_options(parser: argparse.ArgumentParser, prefix: str = "password") -> None:
+    display = prefix.replace("_", "-")
+    parser.add_argument(f"--{display}-command", required=True, help="secret lookup executable")
+    parser.add_argument(
+        f"--{display}-arg",
+        action="append",
+        default=[],
+        help="one secret lookup argument; repeat for multiple arguments",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    local = subparsers.add_parser("local", help="initialize a private local calendar")
+    local.set_defaults(function=command_local)
+
+    caldav = subparsers.add_parser("caldav", help="configure a generic CalDAV account")
+    caldav.add_argument("--url", required=True)
+    caldav.add_argument("--username", required=True)
+    caldav.add_argument("--configure-only", action="store_true")
+    add_password_options(caldav)
+    caldav.set_defaults(function=command_caldav)
+
+    icloud = subparsers.add_parser("icloud", help="configure iCloud CalDAV")
+    icloud.add_argument("--username", required=True, help="Apple ID")
+    icloud.add_argument("--configure-only", action="store_true")
+    add_password_options(icloud)
+    icloud.set_defaults(function=command_icloud)
+
+    google = subparsers.add_parser("google", help="configure Google OAuth calendar access")
+    google.add_argument("--client-id", required=True)
+    google.add_argument("--configure-only", action="store_true")
+    add_password_options(google, "client_secret")
+    google.set_defaults(function=command_google)
+
+    timer = subparsers.add_parser("install-timer", help="install and enable the user sync timer")
+    timer.set_defaults(function=command_install_timer)
+    return parser
+
+
+def main() -> int:
+    os.umask(0o077)
+    args = build_parser().parse_args()
+    args.function(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,13 @@
+[Unit]
+Description=Synchronize Omarchy Calendar
+Documentation=https://github.com/elijahrou/omarchy-calendar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/env omarchy-calendar-sync
+TimeoutStartSec=6min
+NoNewPrivileges=true
+PrivateTmp=true

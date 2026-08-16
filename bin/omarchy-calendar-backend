@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Launch the calendar JSON backend from the plugin checkout."""
+
+import runpy
+from pathlib import Path
+
+backend = Path(__file__).resolve().parents[1] / "backend" / "calendar_backend.py"
+if not backend.is_file():
+    raise SystemExit(f"calendar backend is missing: {backend}")
+runpy.run_path(str(backend), run_name="__main__")

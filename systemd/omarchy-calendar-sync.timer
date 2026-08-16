@@ -1,0 +1,12 @@
+[Unit]
+Description=Synchronize Omarchy Calendar periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=omarchy-calendar-sync.service
+
+[Install]
+WantedBy=timers.target
