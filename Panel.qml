@@ -733,36 +733,56 @@ Panel {
           width: parent.width
           spacing: Style.space(10)
 
-          Row {
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.space(12)
+          Item {
+            width: parent.width
+            height: monthNavigation.implicitHeight
+
+            Row {
+              id: monthNavigation
+              anchors.horizontalCenter: parent.horizontalCenter
+              spacing: Style.space(12)
+
+              Button {
+                iconText: "󰅁"
+                tooltipText: "Previous month"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                focusable: true
+                onClicked: root.moveMonth(-1)
+              }
+              Text {
+                width: Style.space(230)
+                anchors.verticalCenter: parent.verticalCenter
+                horizontalAlignment: Text.AlignHCenter
+                text: Qt.formatDate(root.viewDate, "MMMM yyyy").toUpperCase()
+                color: root.contentForeground
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.title
+                font.bold: true
+                font.letterSpacing: 1
+              }
+              Button {
+                iconText: "󰅂"
+                tooltipText: "Next month"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                focusable: true
+                onClicked: root.moveMonth(1)
+              }
+            }
 
             Button {
-              iconText: "󰅁"
-              tooltipText: "Previous month"
-              foreground: root.contentForeground
-              fontFamily: root.contentFontFamily
-              focusable: true
-              onClicked: root.moveMonth(-1)
-            }
-            Text {
-              width: Style.space(230)
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
-              horizontalAlignment: Text.AlignHCenter
-              text: Qt.formatDate(root.viewDate, "MMMM yyyy").toUpperCase()
-              color: root.contentForeground
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-              font.letterSpacing: 1
-            }
-            Button {
-              iconText: "󰅂"
-              tooltipText: "Next month"
+              iconText: "󰒓"
+              tooltipText: "Calendar settings"
               foreground: root.contentForeground
               fontFamily: root.contentFontFamily
+              bordered: false
               focusable: true
-              onClicked: root.moveMonth(1)
+              enabled: !root.anyOperationBusy && !root.addingAccount && !root.addingEvent
+              onClicked: root.startAccountSetup()
             }
           }
 
@@ -844,44 +864,37 @@ Panel {
             }
           }
 
-          Row {
+          Item {
             width: monthGrid.width
+            height: upcomingHeading.implicitHeight
             anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.space(8)
-            Button {
-              id: addCalendarButton
-              text: "Add calendar"
-              foreground: root.contentForeground
-              fontFamily: root.contentFontFamily
-              bordered: true
-              focusable: true
-              enabled: !root.anyOperationBusy && !root.addingAccount && !root.addingEvent
-              onClicked: root.startAccountSetup()
+
+            Text {
+              id: upcomingHeading
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: "UPCOMING FROM " + root.selectedKey
+              color: Qt.darker(root.contentForeground, 1.35)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1
             }
-            Item { width: parent.width - addCalendarButton.width - addEventButton.width - parent.spacing * 2; height: 1 }
+
             Button {
               id: addEventButton
-              text: "Add event"
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
               iconText: "+"
+              tooltipText: "Add event"
               foreground: root.contentForeground
               fontFamily: root.contentFontFamily
-              bordered: true
+              bordered: false
               focusable: true
               enabled: !root.anyOperationBusy && !root.addingAccount && !root.addingEvent
                 && !root.calendarsLoading && root.calendars.length > 0
               onClicked: root.startAdd()
             }
-          }
-
-          Text {
-            width: monthGrid.width
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: "UPCOMING FROM " + root.selectedKey
-            color: Qt.darker(root.contentForeground, 1.35)
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            font.letterSpacing: 1
           }
 
           Text {
