@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+
+omarchy plugin validate .
+node tests/model.test.js
+node --check Model.js
+node --check tests/model.test.js
+qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml Panel.qml
+qmllint Model.js
+
+printf 'QML validation passed\n'

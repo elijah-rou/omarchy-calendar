@@ -16,6 +16,7 @@ for script in (
     py_compile.compile(script, doraise=True)
 PY
 python -m unittest discover -s tests -p 'test_*.py' -v
+./scripts/validate-qml
 
 if command -v ruff >/dev/null 2>&1; then
   ruff check backend tests
@@ -24,10 +25,10 @@ if command -v ruff >/dev/null 2>&1; then
   done
 fi
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck scripts/validate
+  shellcheck bin/omarchy-calendar scripts/validate scripts/validate-qml
 fi
 
-for script in bin/omarchy-calendar-backend bin/omarchy-calendar-setup bin/omarchy-calendar-sync scripts/validate; do
+for script in bin/omarchy-calendar bin/omarchy-calendar-backend bin/omarchy-calendar-setup bin/omarchy-calendar-sync scripts/validate scripts/validate-qml; do
   test -x "$script" || { printf 'not executable: %s\n' "$script" >&2; exit 1; }
 done
 

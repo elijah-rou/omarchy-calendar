@@ -14,6 +14,17 @@ to network services or credential stores.
 The backend and generated configuration are verified against the exact CLI and
 configuration behavior of khal 0.14.0 and vdirsyncer 0.20.0.
 
+## Install
+
+```sh
+omarchy pkg add khal vdirsyncer python-aiohttp-oauthlib libsecret
+omarchy plugin add https://github.com/elijah-rou/omarchy-calendar.git --enable
+omarchy plugin disable omarchy.clock
+```
+
+During local development, link the repository to
+`~/.config/omarchy/plugins/elijahrou.calendar` instead of cloning it.
+
 ## Setup
 
 All generated files use the `omarchy-calendar` namespace:
@@ -29,14 +40,14 @@ Directories are mode `0700`; generated configuration and status files are mode
 Initialize a local, writable calendar:
 
 ```sh
-./bin/omarchy-calendar-setup local
+./bin/omarchy-calendar setup local
 ```
 
 Generic CalDAV uses an argv-based secret lookup. Each
 `--password-arg` adds one argument without invoking a shell:
 
 ```sh
-./bin/omarchy-calendar-setup caldav \
+./bin/omarchy-calendar setup caldav \
   --url https://calendar.example.com/dav/ \
   --username me@example.com \
   --password-command secret-tool \
@@ -51,7 +62,7 @@ For iCloud, create an app-specific password and keep it in the selected secret
 store. The setup command supplies the CalDAV URL:
 
 ```sh
-./bin/omarchy-calendar-setup icloud \
+./bin/omarchy-calendar setup icloud \
   --username me@icloud.com \
   --password-command pass \
   --password-arg show \
@@ -63,7 +74,7 @@ Google OAuth desktop client, store its client secret outside this repository,
 and expose it through a lookup command:
 
 ```sh
-./bin/omarchy-calendar-setup google \
+./bin/omarchy-calendar setup google \
   --client-id CLIENT_ID.apps.googleusercontent.com \
   --client-secret-command pass \
   --client-secret-arg show \
@@ -79,7 +90,7 @@ OAuth tokens are written by vdirsyncer to the private XDG state directory.
 Install the checked-in systemd user units and enable a sync every 15 minutes:
 
 ```sh
-./bin/omarchy-calendar-setup install-timer
+./bin/omarchy-calendar setup install-timer
 ```
 
 This copies the sync command to `~/.local/bin`, copies the service and timer to
@@ -87,7 +98,7 @@ the user systemd directory, reloads the user manager, and enables the timer.
 
 ## Backend protocol
 
-Run `bin/omarchy-calendar-backend` and send exactly one UTF-8 JSON object on
+Run `bin/omarchy-calendar request` and send exactly one UTF-8 JSON object on
 standard input. It writes exactly one compact JSON object plus a newline to
 standard output. Application errors are JSON responses; subprocess diagnostics
 never share stdout. Requests are limited to 64 KiB, responses to 1 MiB, list
@@ -103,13 +114,14 @@ successful response. Unknown fields and incorrectly typed values are rejected.
 {"action":"list","start":"2026-07-01","end":"2026-08-01","calendars":["local"]}
 ```
 
-Returns `{"ok":true,"events":[...]}`. Dates use `YYYY-MM-DD`; `end` must be
-after `start`. Omit `calendars` to include all calendars.
+Returns `{"ok":true,"events":[...]}`. Event objects use `calendarId`,
+`calendarName`, ISO local `start`/`end`, and `allDay`. Dates use `YYYY-MM-DD`;
+`end` must be after `start`. Omit `calendars` to include all calendars.
 
 ### Create an event
 
 ```json
-{"action":"create","title":"Review","start":"2026-07-14T10:00","end":"2026-07-14T10:30","calendar":"local","location":"Desk","description":"Quarterly plan"}
+{"action":"create","title":"Review","start":"2026-07-14T10:00","end":"2026-07-14T10:30","calendarId":"local","location":"Desk","description":"Quarterly plan"}
 ```
 
 Timed values use local `YYYY-MM-DDTHH:MM`. For all-day events, set `allDay` to

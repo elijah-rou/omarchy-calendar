@@ -173,20 +173,33 @@ def json_options() -> list[str]:
     return result
 
 
+def normalize_khal_datetime(value: Any, all_day: bool) -> Any:
+    if not isinstance(value, str):
+        return value
+    if all_day:
+        return value[:10]
+    if len(value) == 16 and value[4] == "-" and value[7] == "-" and value[10] == " ":
+        return value[:10] + "T" + value[11:]
+    return value
+
+
 def normalize_event(row: dict[str, Any]) -> dict[str, Any]:
     all_day_value = row.get("all-day")
     if all_day_value not in ("True", "False"):
         raise CommandError("khal", "khal returned an invalid all-day value")
+    all_day = all_day_value == "True"
+    calendar = row.get("calendar", "")
     event = {
         "uid": row.get("uid", ""),
         "title": row.get("title", ""),
-        "start": row.get("start-long", row.get("start", "")),
-        "end": row.get("end-long", row.get("end", "")),
+        "start": normalize_khal_datetime(row.get("start-long", row.get("start", "")), all_day),
+        "end": normalize_khal_datetime(row.get("end-long", row.get("end", "")), all_day),
         "location": row.get("location", ""),
         "description": row.get("description", ""),
-        "calendar": row.get("calendar", ""),
+        "calendarId": calendar,
+        "calendarName": calendar,
         "status": row.get("status", ""),
-        "allDay": all_day_value == "True",
+        "allDay": all_day,
     }
     if not all(isinstance(value, str) for key, value in event.items() if key != "allDay"):
         raise CommandError("khal", "khal returned an invalid event field")
@@ -279,13 +292,17 @@ def write_sync_status(status: dict[str, Any]) -> None:
 def request_create(request: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "action", "requestId", "title", "start", "end", "allDay", "calendar",
-        "location", "description", "sync",
+        "calendarId", "location", "description", "sync",
     }
     validate_keys(request, allowed, {"action", "title", "start", "end"})
     title = bounded_string(request, "title", maximum=512, required=True)
     start_text = bounded_string(request, "start", maximum=16, required=True)
     end_text = bounded_string(request, "end", maximum=16, required=True)
     calendar = bounded_string(request, "calendar", maximum=128)
+    calendar_id = bounded_string(request, "calendarId", maximum=128)
+    if calendar and calendar_id and calendar != calendar_id:
+        raise ProtocolError("invalid_request", "calendar and calendarId must match")
+    calendar = calendar or calendar_id
     location = bounded_string(request, "location", maximum=1024)
     description = bounded_string(request, "description", maximum=8192)
     all_day = request.get("allDay", False)
@@ -328,7 +345,13 @@ def request_calendars(request: dict[str, Any]) -> dict[str, Any]:
     names = [line.strip() for line in output.splitlines() if line.strip()]
     if len(names) > 128 or any(len(name.encode("utf-8")) > 128 for name in names):
         raise ProtocolError("result_too_large", "calendar result exceeds protocol limits")
-    return {"ok": True, "calendars": names}
+    return {
+        "ok": True,
+        "calendars": [
+            {"id": name, "name": name, "writable": True}
+            for name in names
+        ],
+    }
 
 
 def executable_version(name: str) -> str | None:
@@ -388,7 +411,9 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_request() -> dict[str, Any]:
-    raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    # Quickshell keeps the process write channel open, so the protocol is one
+    # newline-delimited JSON request rather than an EOF-delimited document.
+    raw = sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 1)
     if len(raw) > MAX_REQUEST_BYTES:
         raise ProtocolError("request_too_large", f"request exceeds {MAX_REQUEST_BYTES} bytes")
     if not raw.strip():

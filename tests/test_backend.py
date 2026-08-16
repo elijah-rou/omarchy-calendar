@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+WRAPPER = ROOT / "bin" / "omarchy-calendar"
 BACKEND = ROOT / "bin" / "omarchy-calendar-backend"
 SETUP = ROOT / "bin" / "omarchy-calendar-setup"
 SYNC = ROOT / "bin" / "omarchy-calendar-sync"
@@ -107,6 +108,21 @@ class BackendProtocolTests(IsolatedEnvironment):
         config.mkdir(parents=True)
         (config / "khal.conf").write_text("test", encoding="utf-8")
 
+    def test_wrapper_dispatches_request_from_a_symlink(self) -> None:
+        link = self.bin / "omarchy-calendar"
+        link.symlink_to(WRAPPER)
+        result = subprocess.run(
+            [str(link), "request"],
+            input=b'{"action":"status","requestId":"wrapper"}\n',
+            capture_output=True,
+            env=self.env,
+            timeout=10,
+            check=True,
+        )
+        response = json.loads(result.stdout)
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["requestId"], "wrapper")
+
     def test_list_returns_normalized_bounded_events(self) -> None:
         response = self.run_backend(
             {"action": "list", "requestId": "r1", "start": "2030-01-01", "end": "2030-01-04", "calendars": ["work"]}
@@ -114,6 +130,8 @@ class BackendProtocolTests(IsolatedEnvironment):
         self.assertTrue(response["ok"])
         self.assertEqual(response["requestId"], "r1")
         self.assertEqual(response["events"][0]["title"], "Standup")
+        self.assertEqual(response["events"][0]["calendarId"], "work")
+        self.assertEqual(response["events"][0]["start"], "2030-01-02T10:00")
         self.assertFalse(response["events"][0]["allDay"])
         self.assertNotIn("all-day", response["events"][0])
         log = Path(self.env["COMMAND_LOG"]).read_text()
@@ -144,7 +162,13 @@ class BackendProtocolTests(IsolatedEnvironment):
 
     def test_calendars_and_status(self) -> None:
         calendars = self.run_backend({"action": "calendars"})
-        self.assertEqual(calendars, {"ok": True, "calendars": ["local", "work"]})
+        self.assertEqual(calendars, {
+            "ok": True,
+            "calendars": [
+                {"id": "local", "name": "local", "writable": True},
+                {"id": "work", "name": "work", "writable": True},
+            ],
+        })
         status = self.run_backend({"action": "status"})
         self.assertTrue(status["configured"])
         self.assertEqual(status["versions"]["khal"], "khal, version 0.14.0")
