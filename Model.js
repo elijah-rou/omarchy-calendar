@@ -415,8 +415,82 @@ function militaryTime(value) {
   return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 ? hour * 60 + minute : null
 }
 
-function invalidCreate(field, error) {
+function invalidInput(field, error) {
   return { valid: false, field: field, error: error, value: null }
+}
+
+function invalidCreate(field, error) {
+  return invalidInput(field, error)
+}
+
+function utf8Length(value) {
+  var text = String(value === undefined || value === null ? "" : value)
+  var bytes = 0
+  for (var i = 0; i < text.length; i++) {
+    var code = text.charCodeAt(i)
+    if (code < 0x80) bytes += 1
+    else if (code < 0x800) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length
+             && text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+      bytes += 4
+      i++
+    } else bytes += 3
+  }
+  return bytes
+}
+
+function durableSetupFields(input) {
+  var source = input && typeof input === "object" ? input : {}
+  var provider = trimmed(source.provider, 16).toLowerCase()
+  var value = { provider: provider }
+  var displayName = trimmed(source.displayName, 256)
+  if (displayName !== "") value.displayName = displayName
+  if (provider === "google") {
+    value.clientId = trimmed(source.clientId, 512)
+  } else if (provider === "caldav" || provider === "icloud") {
+    value.username = trimmed(source.username, 512)
+    if (provider === "caldav") value.url = trimmed(source.url, 4096)
+  }
+  return value
+}
+
+function validateSetupInput(input) {
+  var source = input && typeof input === "object" ? input : {}
+  var value = durableSetupFields(source)
+  if (["google", "caldav", "icloud"].indexOf(value.provider) === -1)
+    return invalidInput("provider", "Choose Google, iCloud, or CalDAV")
+  var rawDisplayName = String(source.displayName === undefined || source.displayName === null ? "" : source.displayName)
+  if (utf8Length(rawDisplayName.replace(/^\s+|\s+$/g, "")) > 256 || /[\x00\r\n]/.test(rawDisplayName))
+    return invalidInput("displayName", "Display name is too long or contains a line break")
+
+  if (value.provider === "google") {
+    var rawClientId = String(source.clientId === undefined || source.clientId === null ? "" : source.clientId)
+    if (value.clientId === "") return invalidInput("clientId", "Enter the Google Desktop OAuth client ID")
+    if (utf8Length(rawClientId.replace(/^\s+|\s+$/g, "")) > 512 || /[\x00\r\n]/.test(rawClientId))
+      return invalidInput("clientId", "OAuth client ID is too long or contains a line break")
+  } else {
+    var rawUsername = String(source.username === undefined || source.username === null ? "" : source.username)
+    if (value.username === "")
+      return invalidInput("username", value.provider === "icloud" ? "Enter your Apple ID" : "Enter the CalDAV username")
+    if (utf8Length(rawUsername.replace(/^\s+|\s+$/g, "")) > 512 || /[\x00\r\n]/.test(rawUsername))
+      return invalidInput("username", "Username is too long or contains a line break")
+    if (value.provider === "caldav") {
+      var rawUrl = String(source.url === undefined || source.url === null ? "" : source.url)
+      var authority = /^https?:\/\/([^\/?#]+)(?:[\/?#]|$)/i.exec(value.url)
+      if (!authority || authority[1].indexOf("@") !== -1 || /\s/.test(authority[1]))
+        return invalidInput("url", "Use an HTTP(S) CalDAV URL without embedded credentials")
+      if (utf8Length(rawUrl.replace(/^\s+|\s+$/g, "")) > 4096 || /[\x00\r\n]/.test(rawUrl))
+        return invalidInput("url", "CalDAV URL is too long or contains a line break")
+    }
+  }
+
+  var secret = String(source.secret === undefined || source.secret === null ? "" : source.secret)
+  if (secret.replace(/^\s+|\s+$/g, "") === "")
+    return invalidInput("secret", value.provider === "google" ? "Enter the OAuth client secret" : "Enter the app password")
+  if (utf8Length(secret) > 16384 || /[\x00\r\n]/.test(secret))
+    return invalidInput("secret", "Secret is too long or contains a line break")
+  value.secret = secret
+  return { valid: true, field: "", error: "", value: value }
 }
 
 function validateCreateInput(input) {
@@ -488,6 +562,8 @@ if (typeof module !== "undefined") {
     mapEventsByDate: mapEventsByDate,
     upcomingEvents: upcomingEvents,
     militaryTime: militaryTime,
+    durableSetupFields: durableSetupFields,
+    validateSetupInput: validateSetupInput,
     validateCreateInput: validateCreateInput,
     localPathForUrl: localPathForUrl,
     clockFormats: clockFormats,

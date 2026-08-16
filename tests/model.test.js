@@ -53,6 +53,60 @@ function testDateMapping() {
   assert.equal(mapped['2026-08-22'], undefined, 'all-day end is exclusive')
 }
 
+function testSetupValidation() {
+  const google = Model.validateSetupInput({
+    provider: 'google', displayName: ' Personal ',
+    clientId: 'desktop.apps.googleusercontent.com', secret: 'oauth-secret'
+  })
+  assert.equal(google.valid, true)
+  assert.deepEqual(google.value, {
+    provider: 'google', displayName: 'Personal',
+    clientId: 'desktop.apps.googleusercontent.com', secret: 'oauth-secret'
+  })
+
+  const icloud = Model.validateSetupInput({
+    provider: 'icloud', username: 'me@icloud.com', secret: 'app-password'
+  })
+  assert.equal(icloud.valid, true)
+  assert.equal(icloud.value.url, undefined)
+  assert.equal(icloud.value.clientId, undefined)
+
+  const caldav = Model.validateSetupInput({
+    provider: 'caldav', username: 'me@example.com',
+    url: 'https://calendar.example.com/dav/', secret: 'app-password'
+  })
+  assert.equal(caldav.valid, true)
+
+  assert.equal(Model.validateSetupInput({ provider: 'other', secret: 'x' }).field, 'provider')
+  assert.equal(Model.validateSetupInput({ provider: 'google', clientId: '', secret: 'x' }).field, 'clientId')
+  assert.equal(Model.validateSetupInput({ provider: 'icloud', username: '', secret: 'x' }).field, 'username')
+  assert.equal(Model.validateSetupInput({
+    provider: 'caldav', username: 'me', url: 'ftp://example.com', secret: 'x'
+  }).field, 'url')
+  assert.equal(Model.validateSetupInput({
+    provider: 'caldav', username: 'me', url: 'https://me:secret@example.com/dav', secret: 'x'
+  }).field, 'url')
+  assert.equal(Model.validateSetupInput({
+    provider: 'caldav', username: 'me', url: 'https://example.com/dav', secret: ''
+  }).field, 'secret')
+  assert.equal(Model.validateSetupInput({
+    provider: 'google', clientId: 'x'.repeat(513), secret: 'x'
+  }).field, 'clientId')
+  assert.equal(Model.validateSetupInput({
+    provider: 'icloud', username: 'me@icloud.com\nother', secret: 'x'
+  }).field, 'username')
+
+  const durable = Model.durableSetupFields({
+    provider: 'caldav', displayName: 'Work', username: 'me',
+    url: 'https://example.com/dav', secret: 'never-store',
+    password: 'also-never-store', clientSecret: 'still-never-store'
+  })
+  assert.deepEqual(durable, {
+    provider: 'caldav', displayName: 'Work', username: 'me', url: 'https://example.com/dav'
+  })
+  assert.equal(JSON.stringify(durable).includes('never-store'), false)
+}
+
 function testCreateValidation() {
   assert.deepEqual(Model.validateCreateInput({
     calendarId: 'work', title: ' Planning ', date: '2026-08-19', start: '09:05', end: '10:30'
@@ -85,5 +139,6 @@ function testCreateValidation() {
 
 testEventNormalization()
 testDateMapping()
+testSetupValidation()
 testCreateValidation()
-console.log('Model.js event tests passed')
+console.log('Model.js tests passed')

@@ -32,6 +32,7 @@ Panel {
   readonly property var agendaEvents: Model.upcomingEvents(events, selectedKey, 8)
   property var calendars: []
   readonly property var calendarOptions: calendarOptionsFor(calendars)
+  property var remoteAccount: ({ connected: false, provider: "", displayName: "", setupMode: "connect" })
 
   property bool listLoading: false
   property bool calendarsLoading: false
@@ -41,6 +42,19 @@ Panel {
   property string backendStatus: ""
   property bool addingEvent: false
   property string formError: ""
+  property bool addingAccount: false
+  property string setupState: "idle"
+  property string setupMessage: ""
+  property string setupError: ""
+  property bool setupCancelled: false
+  property bool setupTimedOut: false
+  property bool setupProtocolError: false
+  property int setupSequence: 0
+  property string activeSetupRequestId: ""
+  property var setupFinalResponse: null
+  property int setupResponseCharacters: 0
+  property int setupResponseLines: 0
+  property bool setupReplacesExisting: false
 
   property int requestSequence: 0
   property var requestQueue: []
@@ -49,6 +63,11 @@ Panel {
   property string latestCalendarsRequestId: ""
   readonly property int maxResponseBytes: 1048576
   readonly property int maxQueuedRequests: 8
+  readonly property int maxSetupResponseCharacters: 65536
+  readonly property int maxSetupResponseLines: 64
+  readonly property bool requestBusy: requestProcess.running || root.activeRequest !== null || root.requestQueue.length > 0
+  readonly property bool setupBusy: setupProcess.running || root.setupState === "running" || root.setupState === "cancelling"
+  readonly property bool anyOperationBusy: root.requestBusy || root.setupBusy
   readonly property string helperPath: Model.localPathForUrl(Qt.resolvedUrl("bin/omarchy-calendar"))
 
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
@@ -68,6 +87,7 @@ Panel {
   function close() {
     root.setCenterHoverRevealSuppressed(false)
     root.cancelAdd()
+    root.closeSetupForm()
     root.controller.hide()
   }
 
@@ -88,6 +108,7 @@ Panel {
   }
 
   function refresh() {
+    if (root.setupBusy) return
     root.today = new Date()
     root.viewYear = root.today.getFullYear()
     root.viewMonth = root.today.getMonth()
@@ -120,6 +141,10 @@ Panel {
   }
 
   function enqueueRequest(request) {
+    if (root.setupBusy) {
+      root.failAction(String(request.action || ""), "Account setup is in progress")
+      return ""
+    }
     if (root.helperPath === "") {
       root.failAction(String(request.action || ""), "Calendar helper path is unavailable")
       return ""
@@ -140,7 +165,7 @@ Panel {
   }
 
   function startNextRequest() {
-    if (requestProcess.running || root.activeRequest || root.requestQueue.length === 0) return
+    if (root.setupBusy || requestProcess.running || root.activeRequest || root.requestQueue.length === 0) return
     var queue = root.requestQueue.slice()
     root.activeRequest = queue.shift()
     root.requestQueue = queue
@@ -245,6 +270,14 @@ Panel {
       root.calendarsLoading = false
       root.calendarError = clean.length === 0 ? "No writable calendars" : ""
     } else if (action === "status") {
+      var account = body && body.remoteAccount && typeof body.remoteAccount === "object"
+        ? body.remoteAccount : {}
+      root.remoteAccount = {
+        connected: account.connected === true,
+        provider: String(account.provider || "").substr(0, 16),
+        displayName: String(account.displayName || "").substr(0, 256),
+        setupMode: account.setupMode === "replace" ? "replace" : "connect"
+      }
       if (body && (body.configured === false || body.ready === false))
         root.backendStatus = String(body.message || "Calendar setup is required")
       else root.backendStatus = body && body.error ? String(body.error) : ""
@@ -308,6 +341,8 @@ Panel {
   }
 
   function startAdd() {
+    if (root.setupBusy) return
+    root.closeSetupForm()
     root.addingEvent = true
     root.formError = ""
     eventCalendar.value = root.calendars.length > 0 ? root.calendars[0].id : ""
@@ -328,7 +363,7 @@ Panel {
   }
 
   function submitAdd() {
-    if (root.createLoading) return
+    if (root.createLoading || root.setupBusy) return
     var checked = Model.validateCreateInput({
       calendarId: eventCalendar.value,
       title: eventTitle.text,
@@ -345,6 +380,198 @@ Panel {
     var request = { action: "create" }
     for (var key in checked.value) request[key] = checked.value[key]
     root.enqueueRequest(request)
+  }
+
+  function startAccountSetup() {
+    if (root.createLoading || root.setupBusy) return
+    root.cancelAdd()
+    root.addingAccount = true
+    root.setupState = "idle"
+    root.setupMessage = ""
+    root.setupError = ""
+    root.setupReplacesExisting = root.remoteAccount.setupMode === "replace"
+    setupProvider.value = "google"
+    setupDisplayName.text = ""
+    setupUsername.text = ""
+    setupUrl.text = ""
+    setupClientId.text = ""
+    setupSecret.text = ""
+    Qt.callLater(function() { setupProvider.forceActiveFocus() })
+  }
+
+  function clearSetupSecret() {
+    setupSecret.text = ""
+    setupProcess.requestText = ""
+  }
+
+  function closeSetupForm() {
+    if (root.setupBusy) return
+    root.clearSetupSecret()
+    root.addingAccount = false
+    root.setupState = "idle"
+    root.setupMessage = ""
+    root.setupError = ""
+    if (setupProvider.popupOpen) setupProvider.close()
+    Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
+  }
+
+  function resetSetupFeedback() {
+    if (root.setupBusy) return
+    root.setupState = "idle"
+    root.setupMessage = ""
+    root.setupError = ""
+  }
+
+  function submitAccountSetup() {
+    if (root.setupBusy) return
+    if (root.requestBusy) {
+      root.setupError = "Wait for the current calendar operation to finish"
+      return
+    }
+    if (root.helperPath === "") {
+      root.setupError = "Calendar helper path is unavailable"
+      return
+    }
+    var checked = Model.validateSetupInput({
+      provider: setupProvider.value,
+      displayName: setupDisplayName.text,
+      username: setupUsername.text,
+      url: setupUrl.text,
+      clientId: setupClientId.text,
+      secret: setupSecret.text
+    })
+    if (!checked.valid) {
+      root.setupError = checked.error
+      return
+    }
+
+    root.setupSequence++
+    root.activeSetupRequestId = "setup-qml-" + root.setupSequence
+    checked.value.requestId = root.activeSetupRequestId
+    setupProcess.requestText = JSON.stringify(checked.value)
+    checked.value.secret = ""
+    root.setupState = "running"
+    root.setupMessage = "Starting account setup…"
+    root.setupError = ""
+    root.setupCancelled = false
+    root.setupTimedOut = false
+    root.setupProtocolError = false
+    root.setupFinalResponse = null
+    root.setupResponseCharacters = 0
+    root.setupResponseLines = 0
+    root.setupReplacesExisting = root.remoteAccount.setupMode === "replace"
+    setupProcess.command = [root.helperPath, "setup-request"]
+    setupProcess.running = true
+  }
+
+  function acceptSetupLine(data) {
+    if (!root.setupBusy || root.setupProtocolError) return
+    var line = String(data || "")
+    root.setupResponseCharacters += line.length + 1
+    root.setupResponseLines++
+    if (line.length === 0 || line.length > 16384
+        || root.setupResponseCharacters > root.maxSetupResponseCharacters
+        || root.setupResponseLines > root.maxSetupResponseLines) {
+      root.setupProtocolError = true
+      root.setupError = "Calendar setup returned too much data"
+      if (setupProcess.running) setupProcess.signal(15)
+      setupHardKill.restart()
+      return
+    }
+    var response = null
+    try { response = JSON.parse(line) }
+    catch (error) {
+      root.setupProtocolError = true
+      root.setupError = "Calendar setup returned invalid progress data"
+      if (setupProcess.running) setupProcess.signal(15)
+      setupHardKill.restart()
+      return
+    }
+    if (!response || typeof response !== "object" || Array.isArray(response)
+        || String(response.requestId || "") !== root.activeSetupRequestId) {
+      root.setupProtocolError = true
+      root.setupError = "Calendar setup response did not match its request"
+      if (setupProcess.running) setupProcess.signal(15)
+      setupHardKill.restart()
+      return
+    }
+    if (response.type === "progress" && root.setupFinalResponse === null) {
+      root.setupMessage = String(response.message || "Working…").substr(0, 500)
+      if (response.replacesExisting === true) root.setupReplacesExisting = true
+    } else if (response.type === "result" && response.final === true && root.setupFinalResponse === null) {
+      root.setupFinalResponse = {
+        ok: response.ok === true,
+        replacesExisting: response.replacesExisting === true,
+        errorMessage: response.error && response.error.message
+          ? String(response.error.message).substr(0, 500) : ""
+      }
+      if (response.replacesExisting === true) root.setupReplacesExisting = true
+      root.setupMessage = response.ok === true ? "Finishing setup…" : ""
+    } else {
+      root.setupProtocolError = true
+      root.setupError = "Calendar setup returned an invalid message sequence"
+      if (setupProcess.running) setupProcess.signal(15)
+      setupHardKill.restart()
+    }
+  }
+
+  function cancelAccountSetup() {
+    if (!root.setupBusy) {
+      root.closeSetupForm()
+      return
+    }
+    if (!setupProcess.running) return
+    root.setupCancelled = true
+    root.setupState = "cancelling"
+    root.setupMessage = "Cancelling account setup…"
+    setupProcess.signal(15)
+    setupHardKill.restart()
+  }
+
+  function finishAccountSetup(exitCode) {
+    setupWatchdog.stop()
+    setupHardKill.stop()
+    root.clearSetupSecret()
+    var finalResponse = root.setupFinalResponse
+    root.setupFinalResponse = null
+
+    if (root.setupCancelled) {
+      root.setupState = "cancelled"
+      root.setupMessage = "Account setup cancelled"
+      root.setupError = ""
+      return
+    }
+    if (root.setupTimedOut) {
+      root.setupState = "error"
+      root.setupMessage = ""
+      root.setupError = "Account setup timed out after 11 minutes"
+      return
+    }
+    if (root.setupProtocolError) {
+      root.setupState = "error"
+      root.setupMessage = ""
+      if (root.setupError === "") root.setupError = "Calendar setup returned invalid data"
+      return
+    }
+    if (exitCode !== 0 || finalResponse === null) {
+      root.setupState = "error"
+      root.setupMessage = ""
+      root.setupError = exitCode !== 0 ? "Calendar setup helper failed" : "Calendar setup ended without a result"
+      return
+    }
+    if (finalResponse.ok !== true) {
+      root.setupState = "error"
+      root.setupMessage = ""
+      root.setupError = finalResponse.errorMessage || "Account setup failed"
+      return
+    }
+
+    root.setupState = "success"
+    root.setupError = ""
+    root.setupMessage = finalResponse.replacesExisting === true
+      ? "Calendar account replaced successfully"
+      : "Calendar account connected successfully"
+    root.refreshData(true)
   }
 
   function eventTime(event) {
@@ -398,6 +625,52 @@ Panel {
     onTriggered: if (requestProcess.running) requestProcess.signal(9)
   }
 
+  Process {
+    id: setupProcess
+    property string requestText: ""
+    stdinEnabled: true
+
+    onStarted: {
+      setupWatchdog.restart()
+      var outgoing = setupProcess.requestText
+      write(outgoing + "\n")
+      outgoing = ""
+      root.clearSetupSecret()
+    }
+    stdout: SplitParser {
+      splitMarker: "\n"
+      onRead: function(data) { root.acceptSetupLine(data) }
+    }
+    stderr: SplitParser {
+      splitMarker: "\n"
+      onRead: function(data) { /* Deliberately discard helper diagnostics. */ }
+    }
+    onExited: function(exitCode) {
+      Qt.callLater(function() { root.finishAccountSetup(exitCode) })
+    }
+  }
+
+  Timer {
+    id: setupWatchdog
+    interval: 660000
+    repeat: false
+    onTriggered: {
+      if (!setupProcess.running) return
+      root.setupTimedOut = true
+      root.setupState = "cancelling"
+      root.setupMessage = "Stopping account setup…"
+      setupProcess.signal(15)
+      setupHardKill.restart()
+    }
+  }
+
+  Timer {
+    id: setupHardKill
+    interval: 2000
+    repeat: false
+    onTriggered: if (setupProcess.running) setupProcess.signal(9)
+  }
+
   SystemClock {
     id: clock
     precision: SystemClock.Minutes
@@ -421,7 +694,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.addingEvent || eventCalendar.popupOpen
+      blocked: root.addingEvent || root.addingAccount || eventCalendar.popupOpen || setupProvider.popupOpen
       onMoveRequested: function(dx, dy) { root.moveSelection(dx + dy * 7) }
       onActivateRequested: root.selectedKey = root.todayKey
       onCloseRequested: root.close()
@@ -435,6 +708,7 @@ Panel {
           root.selectedKey = root.todayKey
           root.requestEventRange()
         } else if (text === "a" || text === "A") root.startAdd()
+        else if (text === "c" || text === "C") root.startAccountSetup()
         else if (text === "r" || text === "R") root.refreshData(true)
       }
 
@@ -565,27 +839,40 @@ Panel {
             width: monthGrid.width
             anchors.horizontalCenter: parent.horizontalCenter
             spacing: Style.space(8)
-            Text {
-              width: parent.width - addButton.width - parent.spacing
-              anchors.verticalCenter: parent.verticalCenter
-              text: "UPCOMING FROM " + root.selectedKey
-              color: Qt.darker(root.contentForeground, 1.35)
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1
-            }
             Button {
-              id: addButton
-              text: "Add"
+              id: addCalendarButton
+              text: "Add calendar"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              bordered: true
+              focusable: true
+              enabled: !root.anyOperationBusy && !root.addingAccount && !root.addingEvent
+              onClicked: root.startAccountSetup()
+            }
+            Item { width: parent.width - addCalendarButton.width - addEventButton.width - parent.spacing * 2; height: 1 }
+            Button {
+              id: addEventButton
+              text: "Add event"
               iconText: "+"
               foreground: root.contentForeground
               fontFamily: root.contentFontFamily
               bordered: true
               focusable: true
-              enabled: !root.calendarsLoading && root.calendars.length > 0
+              enabled: !root.anyOperationBusy && !root.addingAccount && !root.addingEvent
+                && !root.calendarsLoading && root.calendars.length > 0
               onClicked: root.startAdd()
             }
+          }
+
+          Text {
+            width: monthGrid.width
+            anchors.horizontalCenter: parent.horizontalCenter
+            text: "UPCOMING FROM " + root.selectedKey
+            color: Qt.darker(root.contentForeground, 1.35)
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1
           }
 
           Text {
@@ -674,6 +961,174 @@ Panel {
                     font.pixelSize: Style.font.body
                   }
                 }
+              }
+            }
+          }
+
+          Column {
+            visible: root.addingAccount
+            width: monthGrid.width
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.space(7)
+            Keys.onEscapePressed: {
+              if (root.setupBusy) root.close()
+              else root.closeSetupForm()
+            }
+
+            Text {
+              text: "ADD CALENDAR ACCOUNT"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              font.letterSpacing: 1
+            }
+            Text {
+              width: parent.width
+              text: root.setupReplacesExisting || root.remoteAccount.setupMode === "replace"
+                ? "This setup replaces the existing remote account"
+                  + (root.remoteAccount.displayName !== "" ? " (“" + root.remoteAccount.displayName + "”)" : "")
+                  + ". Only one remote account is supported; this does not add a second account."
+                : "Connect one remote calendar account."
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              color: root.setupReplacesExisting || root.remoteAccount.setupMode === "replace"
+                ? Color.urgent : Qt.darker(root.contentForeground, 1.35)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Dropdown {
+              id: setupProvider
+              width: parent.width
+              label: "Provider"
+              value: "google"
+              options: [
+                { value: "google", label: "Google" },
+                { value: "icloud", label: "iCloud" },
+                { value: "caldav", label: "Generic CalDAV" }
+              ]
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              enabled: !root.setupBusy
+              onChanged: function(value) {
+                setupSecret.text = ""
+                root.resetSetupFeedback()
+              }
+            }
+            Text {
+              width: parent.width
+              text: setupProvider.value === "google"
+                ? "Google uses a Desktop OAuth client ID and OAuth client secret. Setup opens your browser to authorize access."
+                : (setupProvider.value === "icloud"
+                  ? "iCloud requires your Apple ID and an app-specific password, not your Apple ID password."
+                  : "Enter the CalDAV server URL, username, and app password or account secret.")
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              color: Qt.darker(root.contentForeground, 1.35)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            TextField {
+              id: setupDisplayName
+              width: parent.width
+              placeholderText: "Display name (optional)"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              enabled: !root.setupBusy
+              onTextChanged: root.resetSetupFeedback()
+            }
+            TextField {
+              id: setupClientId
+              visible: setupProvider.value === "google"
+              width: parent.width
+              placeholderText: "Google Desktop OAuth client ID"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              enabled: !root.setupBusy
+              inputMethodHints: Qt.ImhNoPredictiveText
+              onTextChanged: root.resetSetupFeedback()
+            }
+            TextField {
+              id: setupUsername
+              visible: setupProvider.value !== "google"
+              width: parent.width
+              placeholderText: setupProvider.value === "icloud" ? "Apple ID" : "CalDAV username"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              enabled: !root.setupBusy
+              inputMethodHints: Qt.ImhNoPredictiveText
+              onTextChanged: root.resetSetupFeedback()
+            }
+            TextField {
+              id: setupUrl
+              visible: setupProvider.value === "caldav"
+              width: parent.width
+              placeholderText: "CalDAV URL (https://…)"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              enabled: !root.setupBusy
+              inputMethodHints: Qt.ImhUrlCharactersOnly | Qt.ImhNoPredictiveText
+              onTextChanged: root.resetSetupFeedback()
+            }
+            TextField {
+              id: setupSecret
+              width: parent.width
+              placeholderText: setupProvider.value === "google" ? "OAuth client secret" : "App password / secret"
+              foreground: root.contentForeground
+              font.family: root.contentFontFamily
+              enabled: !root.setupBusy
+              echoMode: TextInput.Password
+              inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
+              onTextChanged: root.resetSetupFeedback()
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                  root.submitAccountSetup()
+                  event.accepted = true
+                }
+              }
+            }
+            Text {
+              visible: root.setupMessage !== ""
+              width: parent.width
+              text: root.setupMessage
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              color: root.setupState === "success" ? Color.accent : root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Text {
+              visible: root.setupError !== ""
+              width: parent.width
+              text: root.setupError
+              wrapMode: Text.Wrap
+              textFormat: Text.PlainText
+              color: Color.urgent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Row {
+              anchors.right: parent.right
+              spacing: Style.space(6)
+              Button {
+                text: root.setupBusy ? "Cancel setup" : "Close"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                focusable: true
+                onClicked: {
+                  if (root.setupBusy) root.cancelAccountSetup()
+                  else root.closeSetupForm()
+                }
+              }
+              Button {
+                visible: !root.setupBusy && root.setupState !== "success"
+                text: root.setupState === "error" || root.setupState === "cancelled" ? "Try again" : "Connect"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                bordered: true
+                focusable: true
+                enabled: !root.requestBusy
+                onClicked: root.submitAccountSetup()
               }
             }
           }
