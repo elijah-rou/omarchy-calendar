@@ -186,6 +186,9 @@ if token_match and phase == "discover":
     if os.environ.get("EMIT_GOOGLE_URL") == "1":
         print("diagnostic that must not be forwarded", flush=True)
         print("https://accounts.google.com/o/oauth2/auth?client_id=desktop&scope=calendar", flush=True)
+    if os.environ.get("GOOGLE_FAILURE"):
+        print(os.environ["GOOGLE_FAILURE"], flush=True)
+        raise SystemExit(7)
     token = pathlib.Path(json.loads(token_match.group(1)))
     token.write_text(json.dumps({"token": config.parent.name}))
 '''
@@ -839,6 +842,24 @@ class WidgetSetupRequestTests(IsolatedEnvironment):
         self.assertEqual(browser[0]["requestId"], "google-browser")
         self.assertTrue(browser[0]["url"].startswith("https://accounts.google.com/"))
         self.assertNotIn(b"diagnostic that must not be forwarded", result.stdout)
+
+    def test_google_failure_reports_safe_calendar_api_guidance(self) -> None:
+        self.env["GOOGLE_FAILURE"] = "Google Calendar API has not been used in project 123"
+        result, lines = self.run_setup_request({
+            "requestId": "google-calendar-api",
+            "provider": "google",
+            "clientId": "desktop.apps.googleusercontent.com",
+            "secret": "oauth-secret",
+        })
+        response = lines[-1]
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "command_failed")
+        self.assertEqual(
+            response["error"]["message"],
+            "Enable Google Calendar API in this OAuth client's Google Cloud project, then connect again",
+        )
+        self.assertNotIn(b"Google Calendar API has not been used", result.stdout)
+        self.assertNotIn(b"oauth-secret", result.stdout)
 
     def test_oversize_candidate_fails_before_commit_and_clears_credential(self) -> None:
         self.env["OVERSIZE_CANDIDATE"] = "1"

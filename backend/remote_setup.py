@@ -601,6 +601,7 @@ def run_process(
     input_buffer: bytearray | None = None,
     output_handler: Callable[[bytes], None] | None = None,
     monitor: Callable[[], None] | None = None,
+    error_message: Callable[[], str] | None = None,
 ) -> None:
     global active_process
     assert argv
@@ -678,7 +679,10 @@ def run_process(
     if returncode in (128 + signal.SIGINT, 128 + signal.SIGTERM, -signal.SIGINT, -signal.SIGTERM):
         raise SetupCancelled()
     if returncode != 0:
-        raise SetupError("command_failed", f"{Path(executable).name} exited unsuccessfully")
+        message = error_message() if error_message is not None else ""
+        if not message:
+            message = f"{Path(executable).name} exited unsuccessfully"
+        raise SetupError("command_failed", message)
 
 
 def validate_candidate_bounds(candidate_root: Path) -> None:
@@ -722,11 +726,11 @@ class GoogleAuthorizationDetector:
         self.emitted = False
 
     def feed(self, chunk: bytes) -> None:
+        self.buffer.extend(chunk)
+        if len(self.buffer) > MAX_COMMAND_OUTPUT_BYTES:
+            del self.buffer[:-MAX_COMMAND_OUTPUT_BYTES]
         if self.emitted:
             return
-        self.buffer.extend(chunk)
-        if len(self.buffer) > MAX_AUTHORIZATION_URL_BYTES * 2:
-            del self.buffer[:-MAX_AUTHORIZATION_URL_BYTES]
         match = AUTHORIZATION_URL.search(self.buffer)
         if match is None:
             return
@@ -752,6 +756,24 @@ class GoogleAuthorizationDetector:
             return
         self.emitted = True
         self.emit_browser(candidate)
+
+    def failure_message(self) -> str:
+        diagnostic = bytes(self.buffer).decode("utf-8", errors="replace").lower()
+        if "access_denied" in diagnostic or "developer-approved testers" in diagnostic:
+            return "Add this Google account as a test user in Google Auth Platform, then connect again"
+        if "calendar api has not been used" in diagnostic or "calendar api is disabled" in diagnostic:
+            return "Enable Google Calendar API in this OAuth client's Google Cloud project, then connect again"
+        if "redirect_uri_mismatch" in diagnostic:
+            return "Create a Desktop OAuth client, then import its downloaded JSON file"
+        if "invalid_client" in diagnostic or "oauth client was not found" in diagnostic:
+            return "Google rejected this OAuth client; recreate a Desktop OAuth client and import its JSON file"
+        if "invalid_grant" in diagnostic or "invalid token" in diagnostic:
+            return "Google rejected the authorization token; connect again and approve access in the browser"
+        return ""
+
+    def clear(self) -> None:
+        self.buffer[:] = b"\x00" * len(self.buffer)
+        self.buffer.clear()
 
 
 def clear_secret(attributes: list[str]) -> bool:
@@ -897,12 +919,16 @@ def setup_remote(
                 assert candidate_root is not None
                 validate_candidate_bounds(candidate_root)
 
-            run_process(
-                ["vdirsyncer", "-c", str(candidate_config), "discover"],
-                COMMAND_TIMEOUT_SECONDS,
-                output_handler=discover_output,
-                monitor=candidate_monitor,
-            )
+            try:
+                run_process(
+                    ["vdirsyncer", "-c", str(candidate_config), "discover"],
+                    COMMAND_TIMEOUT_SECONDS,
+                    output_handler=discover_output,
+                    monitor=candidate_monitor,
+                    error_message=(authorization_detector.failure_message if request["provider"] == "google" else None),
+                )
+            finally:
+                authorization_detector.clear()
             emit_progress("syncing", "Performing initial calendar sync", replaces_existing)
             run_process(
                 ["vdirsyncer", "-c", str(candidate_config), "sync"],
