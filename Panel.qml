@@ -35,7 +35,6 @@ Panel {
   property string backendStatus: ""
   property bool settingsOpen: false
   property bool addFormOpen: false
-  property string thunderbirdError: ""
 
   property int requestSequence: 0
   property var requestQueue: []
@@ -260,13 +259,6 @@ Panel {
       if (subscriptionAction !== "list") Qt.callLater(function() { startSubscription({ action: "list" }, "Updating subscriptions…") })
     }
   }
-  function launchThunderbird() {
-    if (thunderbirdProcess.running) return
-    thunderbirdError = ""
-    thunderbirdProcess.command = ["thunderbird", "-calendar"]
-    thunderbirdProcess.running = true
-  }
-
   Component.onDestruction: {
     if (requestProcess.running) requestProcess.signal(15)
     if (subscriptionProcess.running) subscriptionProcess.signal(15)
@@ -305,12 +297,6 @@ Panel {
     onTriggered: { if (subscriptionProcess.running) { root.subscriptionTimedOut = true; root.subscriptionState = "cancelling"; subscriptionProcess.signal(15); subscriptionHardKill.restart() } }
   }
   Timer { id: subscriptionHardKill; interval: 30000; onTriggered: if (subscriptionProcess.running) subscriptionProcess.signal(9) }
-
-  Process {
-    id: thunderbirdProcess
-    stderr: StdioCollector { waitForEnd: true; onStreamFinished: function() {} }
-    onExited: function(exitCode) { if (exitCode !== 0) root.thunderbirdError = "Unable to open Thunderbird Calendar" }
-  }
 
   SystemClock {
     id: clock
@@ -406,16 +392,11 @@ Panel {
             }
           }
 
-          Item {
-            visible: !root.settingsOpen; width: monthGrid.width; height: upcomingHeading.implicitHeight; anchors.horizontalCenter: parent.horizontalCenter
-            Text { id: upcomingHeading; anchors.left: parent.left; text: "UPCOMING FROM " + root.selectedKey; color: Qt.darker(root.contentForeground, 1.35); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1 }
-            Button {
-              anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; iconText: "+"
-              tooltipText: "Open Thunderbird Calendar"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; bordered: false
-              onClicked: root.launchThunderbird()
-            }
+          Text {
+            visible: !root.settingsOpen; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter
+            text: "UPCOMING FROM " + root.selectedKey; color: Qt.darker(root.contentForeground, 1.35)
+            font.family: root.contentFontFamily; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1
           }
-          Text { visible: !root.settingsOpen && root.thunderbirdError !== ""; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: root.thunderbirdError; color: Color.urgent; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
           Text { visible: !root.settingsOpen && root.listLoading; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: "Loading events…"; color: Qt.darker(root.contentForeground, 1.4); font.family: root.contentFontFamily }
           Text { visible: !root.settingsOpen && !root.listLoading && root.listError !== ""; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: root.listError; wrapMode: Text.Wrap; color: Color.urgent; font.family: root.contentFontFamily }
           Text { visible: !root.settingsOpen && !root.listLoading && root.listError === "" && root.agendaEvents.length === 0; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: "No upcoming events in this view"; color: Qt.darker(root.contentForeground, 1.5); font.family: root.contentFontFamily }

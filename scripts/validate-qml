@@ -18,8 +18,10 @@ if rg -qi 'oauth|icloud|caldav|FileDialog|QtQuick\.Dialogs|zenity|validateCreate
   exit 1
 fi
 rg -q 'Settings → Integrate calendar → Secret address in iCal format' Panel.qml
-rg -q 'command = \["thunderbird", "-calendar"\]' Panel.qml
-rg -q 'tooltipText: "Open Thunderbird Calendar"' Panel.qml
+if rg -qi 'thunderbird|Open Thunderbird|iconText:[[:space:]]*"\+"' Panel.qml Model.js BarWidget.qml; then
+  printf 'external calendar launcher found in read-only widget UI\n' >&2
+  exit 1
+fi
 
 # Qt's standalone parser does not understand Quickshell's typed IPC methods.
 lint_entry="$root/.BarWidget.lint.qml"
