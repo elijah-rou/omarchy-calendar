@@ -4,6 +4,19 @@ An Itsycal-style, read-only calendar and agenda for the Omarchy bar. Calendar
 subscriptions and generated data stay in private XDG directories. The shell
 uses bounded JSON protocols rather than contacting feeds or credential stores.
 
+## Upstream and provenance
+
+This repository is a standalone fork of the built-in
+[Omarchy clock panel](https://github.com/basecamp/omarchy/tree/72ffd58316265bb770dddfc77983117bf9b91f0a/shell/plugins/panels/clock).
+The original date/time model, bar integration, and month-panel QML were extracted
+from the Omarchy monorepo, then adapted into this separately installable plugin.
+The ICS subscription backend, Secret Service integration, read-only agenda, and
+refresh lifecycle were added here.
+
+GitHub lists this as an independent repository rather than a network fork because
+only the clock plugin was extracted, not the entire `basecamp/omarchy` monorepo.
+The upstream MIT copyright notice is retained in `LICENSE`.
+
 ## Requirements
 
 - Python 3.11 or newer
@@ -127,5 +140,5 @@ Tests use isolated XDG roots and fake Secret Service and khal commands.
 
 ## License
 
-MIT. The calendar grid and bar integration derive from Omarchy's MIT-licensed
-clock plugin.
+MIT. See [Upstream and provenance](#upstream-and-provenance) and `LICENSE` for
+the retained Omarchy copyright notice.
