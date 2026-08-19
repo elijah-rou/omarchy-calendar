@@ -92,14 +92,14 @@ Panel {
   }
 
   function close() {
-    // KeyboardPanel dismisses outside clicks. A native file dialog lives
-    // outside that surface, so preserve this form while it owns interaction.
     if (root.googleClientPickerOpen) return
+    root.setCenterHoverRevealSuppressed(false)
     if (root.setupBusy) {
-      root.cancelAccountSetup()
+      // Browser authorization happens outside the overlay. Dismiss the panel
+      // without treating that click as cancellation; reopening shows progress.
+      root.controller.hide()
       return
     }
-    root.setCenterHoverRevealSuppressed(false)
     root.cancelAdd()
     root.closeSetupForm()
     root.controller.hide()
@@ -1074,7 +1074,7 @@ Panel {
             anchors.horizontalCenter: parent.horizontalCenter
             spacing: Style.space(7)
             Keys.onEscapePressed: {
-              if (root.setupBusy) root.cancelAccountSetup()
+              if (root.setupBusy) root.close()
               else root.closeSetupForm()
             }
 
