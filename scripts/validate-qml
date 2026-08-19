@@ -13,11 +13,12 @@ qmllint Model.js
 
 # The v1 UI is subscription-only. Provider account setup, writable event UI,
 # and native file dialogs must not creep back into the shipped QML/model.
-if rg -qi 'oauth|icloud|caldav|FileDialog|QtQuick\.Dialogs|zenity|validateCreateInput|validateSetupInput|setup-request|action:[[:space:]]*"create"' Panel.qml Model.js BarWidget.qml tests/model.test.js; then
+if rg -qi 'oauth|caldav|FileDialog|QtQuick\.Dialogs|zenity|validateCreateInput|validateSetupInput|setup-request|action:[[:space:]]*"create"' Panel.qml Model.js BarWidget.qml tests/model.test.js; then
   printf 'legacy provider, writable-event, or native-dialog UI found\n' >&2
   exit 1
 fi
 rg -q 'Settings → Integrate calendar → Secret address in iCal format' Panel.qml
+rg -q 'Share Calendar → Public Calendar → Copy Link, then change webcal:// to https://' Panel.qml
 if rg -qi 'thunderbird|Open Thunderbird|iconText:[[:space:]]*"\+"' Panel.qml Model.js BarWidget.qml; then
   printf 'external calendar launcher found in read-only widget UI\n' >&2
   exit 1

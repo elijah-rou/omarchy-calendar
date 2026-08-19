@@ -438,6 +438,7 @@ Panel {
             Text { text: "ICS SUBSCRIPTIONS"; color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.body; font.bold: true; font.letterSpacing: 1 }
             Text { width: parent.width; text: "Private feed URLs and optional credentials are stored in Secret Service. URLs are never shown after saving. Maximum 16 subscriptions."; wrapMode: Text.Wrap; color: Qt.darker(root.contentForeground, 1.3); font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
             Text { width: parent.width; text: "Google Calendar: Settings → Integrate calendar → Secret address in iCal format."; wrapMode: Text.Wrap; color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
+            Text { width: parent.width; text: "iCloud Calendar: Share Calendar → Public Calendar → Copy Link, then change webcal:// to https://. Anyone with the link can read it."; wrapMode: Text.Wrap; color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
             Repeater {
               model: root.subscriptions
               Rectangle {

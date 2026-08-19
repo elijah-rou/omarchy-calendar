@@ -31,6 +31,12 @@ configuration, status, logs, or errors. The private mode-`0600`
 `subscriptions.json` contains only IDs, names, and colors. Secret Service items
 use deterministic attributes namespaced to the installation's XDG roots.
 
+For Google Calendar, open **Settings → Integrate calendar** and copy the
+**Secret address in iCal format**. For iCloud Calendar, share the calendar,
+enable **Public Calendar**, and copy its link. Change the iCloud link's
+`webcal://` prefix to `https://` before adding it. Publishing an iCloud calendar
+allows anyone with that link to read its events, so treat the link as a secret.
+
 Requests are at most 64 KiB and require a nonempty `requestId` of at most 128
 bytes. Output consists
 of bounded progress objects followed by exactly one final result:
