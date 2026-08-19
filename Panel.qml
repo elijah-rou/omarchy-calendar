@@ -57,6 +57,7 @@ Panel {
   property bool subscriptionTimedOut: false
   property bool subscriptionCancelled: false
   property bool subscriptionCommitStarted: false
+  property bool subscriptionCredentialCritical: false
   readonly property bool subscriptionBusy: subscriptionProcess.running || subscriptionState === "running" || subscriptionState === "cancelling"
 
   readonly property string helperPath: Model.localPathForUrl ? Model.localPathForUrl(Qt.resolvedUrl("bin/omarchy-calendar")) : String(Qt.resolvedUrl("bin/omarchy-calendar")).replace(/^file:\/\//, "")
@@ -215,7 +216,7 @@ Panel {
     subscriptionState = "running"; subscriptionMessage = message; subscriptionError = ""
     subscriptionProtocolState = { finalSeen: false, progressCount: 0 }
     subscriptionResponseCharacters = 0; subscriptionResponseLines = 0
-    subscriptionTimedOut = false; subscriptionCancelled = false; subscriptionCommitStarted = false
+    subscriptionTimedOut = false; subscriptionCancelled = false; subscriptionCommitStarted = false; subscriptionCredentialCritical = false
     subscriptionProcess.command = [helperPath, "subscriptions"]
     subscriptionProcess.running = true
   }
@@ -229,6 +230,7 @@ Panel {
     if (!parsed.valid) { failSubscriptionProtocol(parsed.error); return }
     subscriptionProtocolState = parsed.state
     if (parsed.kind === "progress") {
+      subscriptionCredentialCritical = parsed.response.stage === "securing"
       if (parsed.response.stage === "committing") subscriptionCommitStarted = true
       subscriptionMessage = String(parsed.response.stage || "Working…").replace(/^./, function(c) { return c.toUpperCase() }) + "…"
     }
@@ -253,7 +255,7 @@ Panel {
   }
   function cancelSubscription() {
     clearCredentialFields()
-    if (!subscriptionBusy || !subscriptionProcess.running || subscriptionCommitStarted) return
+    if (!subscriptionBusy || !subscriptionProcess.running || subscriptionCommitStarted || subscriptionCredentialCritical) return
     subscriptionCancelled = true; subscriptionState = "cancelling"; subscriptionMessage = "Cancelling subscription operation…"
     subscriptionProcess.signal(15); subscriptionHardKill.restart()
   }
@@ -464,7 +466,7 @@ Panel {
             width: root.settingsOpen ? Style.space(410) : monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; spacing: Style.space(4)
             Text { width: parent.width; visible: root.subscriptionMessage !== ""; text: root.subscriptionMessage; wrapMode: Text.Wrap; color: root.subscriptionState === "success" ? Color.accent : root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
             Text { width: parent.width; visible: root.subscriptionError !== ""; text: root.subscriptionError; wrapMode: Text.Wrap; color: Color.urgent; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
-            Button { visible: root.subscriptionBusy && !root.subscriptionCommitStarted; text: "Cancel operation"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; onClicked: root.cancelSubscription() }
+            Button { visible: root.subscriptionBusy && !root.subscriptionCommitStarted && !root.subscriptionCredentialCritical; text: "Cancel operation"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; onClicked: root.cancelSubscription() }
           }
           Text { visible: !root.settingsOpen && root.backendStatus !== ""; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: root.backendStatus; wrapMode: Text.Wrap; color: Color.urgent; font.family: root.contentFontFamily; font.pixelSize: Style.font.caption }
         }

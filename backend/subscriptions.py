@@ -43,6 +43,7 @@ Progress = Callable[[str, dict[str, Any]], None]
 active_process: subprocess.Popen[bytes] | None = None
 commit_started = False
 commit_completed = False
+credential_store_critical = False
 
 
 class SubscriptionError(Exception):
@@ -58,9 +59,10 @@ class OperationCancelled(SubscriptionError):
 
 
 def reset_commit_state() -> None:
-    global commit_started, commit_completed
+    global commit_started, commit_completed, credential_store_critical
     commit_started = False
     commit_completed = False
+    credential_store_critical = False
 
 
 def begin_commit(progress: Progress, subscription_id: str) -> None:
@@ -216,7 +218,14 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=2)
 
 
-def run_bounded(argv: list[str], *, input_bytes: bytes | None = None, timeout: int, output_limit: int = MAX_COMMAND_OUTPUT) -> bytes:
+def run_bounded(
+    argv: list[str],
+    *,
+    input_bytes: bytes | None = None,
+    timeout: int,
+    output_limit: int = MAX_COMMAND_OUTPUT,
+    accepted_returncodes: frozenset[int] = frozenset((0,)),
+) -> bytes:
     global active_process
     assert argv
     process = subprocess.Popen(
@@ -265,7 +274,7 @@ def run_bounded(argv: list[str], *, input_bytes: bytes | None = None, timeout: i
         process.stdout.close()
         process.stderr.close()
         active_process = None
-    if returncode != 0:
+    if returncode not in accepted_returncodes:
         raise SubscriptionError("command_failed", "calendar helper failed")
     return bytes(output)
 
@@ -303,7 +312,13 @@ def lookup_secret(subscription_id: str) -> dict[str, str]:
 
 def clear_secret(subscription_id: str) -> bool:
     try:
-        run_bounded([secret_tool(), "clear", *secret_attributes(subscription_id)], timeout=SECRET_TIMEOUT_SECONDS)
+        # secret-tool exits 1 when no matching item exists. That is already the
+        # desired cleanup state and must not create an unrecoverable tombstone.
+        run_bounded(
+            [secret_tool(), "clear", *secret_attributes(subscription_id)],
+            timeout=SECRET_TIMEOUT_SECONDS,
+            accepted_returncodes=frozenset((0, 1)),
+        )
         return True
     except SubscriptionError:
         return False
@@ -633,16 +648,21 @@ def add_subscription(request: dict[str, Any], progress: Progress) -> dict[str, A
     if username is not None:
         assert password is not None
         credential.update({"username": username, "password": password})
-    stored = False
+    store_attempted = False
     committed = False
     destination = paths()["calendars"] / subscription_id
     try:
         subscriptions = load_subscriptions()
         if len(subscriptions) >= MAX_SUBSCRIPTIONS:
             raise SubscriptionError("subscription_limit", f"at most {MAX_SUBSCRIPTIONS} subscriptions are allowed")
-        progress("storing", {"subscriptionId": subscription_id})
-        store_secret(subscription_id, credential)
-        stored = True
+        global credential_store_critical
+        progress("securing", {"subscriptionId": subscription_id})
+        store_attempted = True
+        credential_store_critical = True
+        try:
+            store_secret(subscription_id, credential)
+        finally:
+            credential_store_critical = False
         progress("fetching", {"subscriptionId": subscription_id})
         content = fetch_feed(credential)
         if len(content) > MAX_FEED_BYTES:
@@ -672,7 +692,7 @@ def add_subscription(request: dict[str, Any], progress: Progress) -> dict[str, A
         return result
     except (SubscriptionError, OSError) as error:
         shutil.rmtree(destination, ignore_errors=True)
-        cleanup_failed = stored and not committed and not clear_secret(subscription_id)
+        cleanup_failed = store_attempted and not committed and not clear_secret(subscription_id)
         if cleanup_failed:
             remember_cleanup(subscription_id)
             message = (error.message if isinstance(error, SubscriptionError) else "subscription storage failed")
@@ -805,7 +825,7 @@ def encode_line(value: dict[str, Any]) -> bytes:
 
 
 def handle_termination(_signum: int, _frame: Any) -> None:
-    if commit_started:
+    if commit_started or credential_store_critical:
         # Once committing is announced, finish rollback or post-commit cleanup
         # and let the final protocol result describe the durable outcome.
         return

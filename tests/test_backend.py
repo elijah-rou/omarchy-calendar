@@ -73,7 +73,7 @@ elif args[0] == "lookup":
     if key not in values: raise SystemExit(1)
     sys.stdout.write(values[key])
 elif args[0] == "clear":
-    if os.environ.get("KEYRING_CLEAR_FAIL") == "1": raise SystemExit(1)
+    if os.environ.get("KEYRING_CLEAR_FAIL") == "1": raise SystemExit(4)
     values.pop(key, None)
     path.write_text(json.dumps(values, separators=(",", ":")))
 else: raise SystemExit(2)
@@ -230,6 +230,25 @@ class SubscriptionTests(Isolated):
         pending = subscriptions.load_cleanup_pending()
         self.assertEqual(len(pending), 1)
         subscriptions.refresh_subscriptions()
+        self.assertEqual(subscriptions.load_cleanup_pending(), [])
+        self.assertEqual(json.loads(Path(self.env["KEYRING_PATH"]).read_text()), {})
+
+    def test_cancel_after_secret_persistence_cleans_uncommitted_credential(self) -> None:
+        original_store = subscriptions.store_secret
+
+        def persist_then_cancel(subscription_id: str, credential: dict[str, str]) -> None:
+            original_store(subscription_id, credential)
+            raise subscriptions.OperationCancelled()
+
+        with (
+            mock.patch.object(subscriptions, "store_secret", side_effect=persist_then_cancel),
+            self.assertRaises(subscriptions.OperationCancelled),
+        ):
+            subscriptions.add_subscription(
+                {"action": "add", "name": "Cancelled", "url": "https://example.test/private.ics"},
+                lambda *_args: None,
+            )
+        self.assertEqual(subscriptions.load_subscriptions(), [])
         self.assertEqual(subscriptions.load_cleanup_pending(), [])
         self.assertEqual(json.loads(Path(self.env["KEYRING_PATH"]).read_text()), {})
 
