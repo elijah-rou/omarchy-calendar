@@ -11,6 +11,12 @@ node --check tests/model.test.js
 qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml Panel.qml
 qmllint Model.js
 
+if rg -q 'QtQuick\.Dialogs|\bFileDialog\s*\{' Panel.qml; then
+  printf 'Panel.qml must use an external file picker; native Qt dialogs can crash Quickshell\n' >&2
+  exit 1
+fi
+rg -q '"/usr/bin/zenity"' Panel.qml
+
 # Qt's standalone parser does not understand Quickshell's typed IPC methods.
 # Strip only the `: void` return annotation in a same-directory lint copy so
 # relative imports still resolve and the rest of the shipped entry point parses.

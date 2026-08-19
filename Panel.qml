@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Dialogs
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -84,6 +83,7 @@ Panel {
   readonly property int cellSpacing: Style.space(2)
 
   function open() {
+    if (root.googleClientPickerOpen) return
     refresh()
     root.controller.show()
     Qt.callLater(function() {
@@ -423,9 +423,42 @@ Panel {
   }
 
   function openGoogleClientFilePicker() {
-    if (root.setupBusy) return
+    if (root.setupBusy || googleClientPickerProcess.running) return
+    var home = Quickshell.env("HOME") || ""
+    var command = [
+      "/usr/bin/zenity",
+      "--file-selection",
+      "--title=Import Google Desktop OAuth JSON",
+      "--file-filter=JSON files | *.json"
+    ]
+    if (home !== "") command.push("--filename=" + home + "/Downloads/")
     root.googleClientPickerOpen = true
-    googleClientFileDialog.open()
+    googleClientPickerProcess.outputText = ""
+    googleClientPickerProcess.command = command
+    root.setCenterHoverRevealSuppressed(false)
+    root.controller.hide()
+    googleClientPickerProcess.running = true
+  }
+
+  function finishGoogleClientFilePicker(exitCode) {
+    root.googleClientPickerOpen = false
+    var output = googleClientPickerProcess.outputText
+    googleClientPickerProcess.outputText = ""
+    if (exitCode === 0) {
+      if (output.length > 4097) {
+        root.setupError = "Selected credential path is too long"
+      } else {
+        root.acceptGoogleClientFile(output.replace(/\r?\n$/, ""))
+      }
+    } else if (exitCode !== 1) {
+      root.setupError = "Unable to open the external file picker"
+    }
+    root.controller.show()
+    Qt.callLater(function() {
+      if (!root.opened) return
+      root.setCenterHoverRevealSuppressed(true)
+      if (keyCatcher) keyCatcher.forceActiveFocus()
+    })
   }
 
   function acceptGoogleClientFile(fileUrl) {
@@ -621,18 +654,20 @@ Panel {
     return Qt.formatTime(start, "HH:mm") + "–" + Qt.formatTime(end, "HH:mm")
   }
 
-  FileDialog {
-    id: googleClientFileDialog
-    title: "Import Google Desktop OAuth JSON"
-    fileMode: FileDialog.OpenFile
-    nameFilters: ["JSON files (*.json)"]
-    onAccepted: {
-      root.googleClientPickerOpen = false
-      root.acceptGoogleClientFile(selectedFile)
+  Process {
+    id: googleClientPickerProcess
+    property string outputText: ""
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: googleClientPickerProcess.outputText = String(text || "")
     }
-    onRejected: {
-      root.googleClientPickerOpen = false
-      Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: function() { /* Deliberately discard picker diagnostics. */ }
+    }
+    onExited: function(exitCode) {
+      Qt.callLater(function() { root.finishGoogleClientFilePicker(exitCode) })
     }
   }
 

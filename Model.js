@@ -613,13 +613,16 @@ function validateCreateInput(input) {
 
 function localPathForUrl(value) {
   var text = String(value || "")
-  if (text.indexOf("file:///") !== 0 || /[?#]/.test(text)) return ""
-  try {
-    var path = decodeURIComponent(text.substr(7))
-    return path.indexOf("\0") === -1 && path.charAt(0) === "/" ? path : ""
-  } catch (error) {
-    return ""
+  if (text.indexOf("file:///") === 0) {
+    if (/[?#]/.test(text)) return ""
+    try {
+      text = decodeURIComponent(text.substring(7))
+    } catch (error) {
+      return ""
+    }
   }
+  if (text.charAt(0) !== "/" || /[\0\r\n]/.test(text)) return ""
+  return text
 }
 
 if (typeof module !== "undefined") {

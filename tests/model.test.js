@@ -190,6 +190,14 @@ function testSetupProtocolLifecycle() {
   assert.equal(Model.setupResultPresentation(null, true).state, 'cancelled')
 }
 
+function testCredentialPickerPathValidation() {
+  assert.equal(Model.localPathForUrl('/home/test/Downloads/client.json'), '/home/test/Downloads/client.json')
+  assert.equal(Model.localPathForUrl('file:///home/test/Downloads/client%20name.json'), '/home/test/Downloads/client name.json')
+  assert.equal(Model.localPathForUrl('relative/client.json'), '')
+  assert.equal(Model.localPathForUrl('/home/test/client\n.json'), '')
+  assert.equal(Model.localPathForUrl('file:///home/test/client.json?query'), '')
+}
+
 function testCreateValidation() {
   assert.deepEqual(Model.validateCreateInput({
     calendarId: 'work', title: ' Planning ', date: '2026-08-19', start: '09:05', end: '10:30'
@@ -225,5 +233,6 @@ testDateMapping()
 testSetupValidation()
 testGoogleClientFileSetupValidation()
 testSetupProtocolLifecycle()
+testCredentialPickerPathValidation()
 testCreateValidation()
 console.log('Model.js tests passed')

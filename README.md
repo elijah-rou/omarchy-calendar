@@ -17,7 +17,7 @@ configuration behavior of khal 0.14.0 and vdirsyncer 0.20.0.
 ## Install
 
 ```sh
-omarchy pkg add khal vdirsyncer python-aiohttp-oauthlib libsecret
+omarchy pkg add khal vdirsyncer python-aiohttp-oauthlib libsecret zenity
 omarchy plugin add https://github.com/elijah-rou/omarchy-calendar.git --enable
 omarchy plugin disable omarchy.clock
 ```
