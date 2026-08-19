@@ -60,6 +60,7 @@ Panel {
   property int setupResponseLines: 0
   property bool setupReplacesExisting: false
   property string setupClientFilePath: ""
+  property bool googleClientPickerOpen: false
 
   property int requestSequence: 0
   property var requestQueue: []
@@ -91,6 +92,9 @@ Panel {
   }
 
   function close() {
+    // KeyboardPanel dismisses outside clicks. A native file dialog lives
+    // outside that surface, so preserve this form while it owns interaction.
+    if (root.googleClientPickerOpen) return
     if (root.setupBusy) {
       root.cancelAccountSetup()
       return
@@ -418,6 +422,12 @@ Panel {
     setupProcess.requestText = ""
   }
 
+  function openGoogleClientFilePicker() {
+    if (root.setupBusy) return
+    root.googleClientPickerOpen = true
+    googleClientFileDialog.open()
+  }
+
   function acceptGoogleClientFile(fileUrl) {
     if (root.setupBusy || setupProvider.value !== "google") return
     var path = Model.localPathForUrl(String(fileUrl || ""))
@@ -616,7 +626,14 @@ Panel {
     title: "Import Google Desktop OAuth JSON"
     fileMode: FileDialog.OpenFile
     nameFilters: ["JSON files (*.json)"]
-    onAccepted: root.acceptGoogleClientFile(selectedFile)
+    onAccepted: {
+      root.googleClientPickerOpen = false
+      root.acceptGoogleClientFile(selectedFile)
+    }
+    onRejected: {
+      root.googleClientPickerOpen = false
+      Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
+    }
   }
 
   Process {
@@ -1112,7 +1129,7 @@ Panel {
                 bordered: true
                 focusable: true
                 enabled: !root.setupBusy
-                onClicked: googleClientFileDialog.open()
+                onClicked: root.openGoogleClientFilePicker()
               }
               Text {
                 visible: root.setupClientFilePath !== ""
