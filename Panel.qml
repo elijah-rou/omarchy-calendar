@@ -5,8 +5,8 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Itsycal-style calendar popout. BarWidget.qml remains the visible clock and
-// this nested panel keeps the stock open/close/owner contracts used by the bar.
+// Read-only ICS month grid and agenda. Feed credentials cross only the bounded
+// subscription process stdin and are cleared from QML immediately after write.
 Panel {
   id: root
   moduleName: "elijahrou.calendar"
@@ -16,7 +16,6 @@ Panel {
   property var anchorItem: null
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
-
   property date today: new Date()
   property int viewYear: today.getFullYear()
   property int viewMonth: today.getMonth()
@@ -30,52 +29,37 @@ Panel {
   property var events: []
   readonly property var eventsByDate: Model.mapEventsByDate(events)
   readonly property var agendaEvents: Model.upcomingEvents(events, selectedKey, 8)
-  property var calendars: []
-  readonly property var calendarOptions: calendarOptionsFor(calendars)
-  property var remoteAccount: ({ connected: false, provider: "", displayName: "", setupMode: "connect" })
-
+  property var subscriptions: []
   property bool listLoading: false
-  property bool calendarsLoading: false
-  property bool createLoading: false
   property string listError: ""
-  property string calendarError: ""
   property string backendStatus: ""
-  property bool addingEvent: false
-  property string formError: ""
-  property bool addingAccount: false
-  property string setupState: "idle"
-  property string setupStage: ""
-  property string setupMessage: ""
-  property string setupError: ""
-  property string setupWarning: ""
-  property string setupBrowserUrl: ""
-  property bool setupCancelled: false
-  property bool setupTimedOut: false
-  property bool setupProtocolError: false
-  property int setupSequence: 0
-  property string activeSetupRequestId: ""
-  property var setupFinalResponse: null
-  property int setupResponseCharacters: 0
-  property int setupResponseLines: 0
-  property bool setupReplacesExisting: false
-  property string setupClientFilePath: ""
-  property bool googleClientPickerOpen: false
+  property bool settingsOpen: false
+  property bool addFormOpen: false
+  property string thunderbirdError: ""
 
   property int requestSequence: 0
   property var requestQueue: []
   property var activeRequest: null
   property string latestListRequestId: ""
-  property string latestCalendarsRequestId: ""
   readonly property int maxResponseBytes: 1048576
   readonly property int maxQueuedRequests: 8
-  readonly property int maxSetupResponseCharacters: 65536
-  readonly property int maxSetupResponseLines: 64
-  readonly property bool requestBusy: requestProcess.running || root.activeRequest !== null || root.requestQueue.length > 0
-  readonly property bool setupBusy: setupProcess.running || root.setupState === "running" || root.setupState === "cancelling"
-  readonly property bool anyOperationBusy: root.requestBusy || root.setupBusy
-  readonly property string helperPath: Model.localPathForUrl(Qt.resolvedUrl("bin/omarchy-calendar"))
-  readonly property string googleCloudSetupUrl: "https://console.cloud.google.com/auth/clients"
+  readonly property bool requestBusy: requestProcess.running || activeRequest !== null || requestQueue.length > 0
 
+  property int subscriptionSequence: 0
+  property string subscriptionRequestId: ""
+  property string subscriptionAction: ""
+  property string subscriptionState: "idle"
+  property string subscriptionMessage: ""
+  property string subscriptionError: ""
+  property string subscriptionRequestText: ""
+  property var subscriptionProtocolState: ({ finalSeen: false, progressCount: 0 })
+  property int subscriptionResponseCharacters: 0
+  property int subscriptionResponseLines: 0
+  property bool subscriptionTimedOut: false
+  property bool subscriptionCancelled: false
+  readonly property bool subscriptionBusy: subscriptionProcess.running || subscriptionState === "running" || subscriptionState === "cancelling"
+
+  readonly property string helperPath: Model.localPathForUrl ? Model.localPathForUrl(Qt.resolvedUrl("bin/omarchy-calendar")) : String(Qt.resolvedUrl("bin/omarchy-calendar")).replace(/^file:\/\//, "")
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property int cellWidth: Style.space(51)
@@ -83,592 +67,209 @@ Panel {
   readonly property int cellSpacing: Style.space(2)
 
   function open() {
-    if (root.googleClientPickerOpen) return
     refresh()
-    root.controller.show()
-    Qt.callLater(function() {
-      if (root.opened) root.setCenterHoverRevealSuppressed(true)
-    })
+    controller.show()
+    Qt.callLater(function() { if (opened) setCenterHoverRevealSuppressed(true) })
   }
-
   function close() {
-    if (root.googleClientPickerOpen) return
-    root.setCenterHoverRevealSuppressed(false)
-    if (root.setupBusy) {
-      // Browser authorization happens outside the overlay. Dismiss the panel
-      // without treating that click as cancellation; reopening shows progress.
-      root.controller.hide()
-      return
-    }
-    root.cancelAdd()
-    root.closeSetupForm()
-    root.controller.hide()
+    setCenterHoverRevealSuppressed(false)
+    settingsOpen = false
+    addFormOpen = false
+    clearCredentialFields()
+    controller.hide()
   }
-
-  function toggle() {
-    if (root.opened) root.close()
-    else root.open()
-  }
-
+  function toggle() { if (opened) close(); else open() }
   function switchPanel(direction) {
-    if (root.bar && typeof root.bar.switchPanelFrom === "function")
-      return root.bar.switchPanelFrom(root.barIdentity, direction)
+    if (bar && typeof bar.switchPanelFrom === "function") return bar.switchPanelFrom(barIdentity, direction)
     return false
   }
-
   function setCenterHoverRevealSuppressed(value) {
-    if (root.bar && "centerHoverRevealSuppressed" in root.bar)
-      root.bar.centerHoverRevealSuppressed = value
+    if (bar && "centerHoverRevealSuppressed" in bar) bar.centerHoverRevealSuppressed = value
   }
-
   function refresh() {
-    if (root.setupBusy) return
-    root.today = new Date()
-    root.viewYear = root.today.getFullYear()
-    root.viewMonth = root.today.getMonth()
-    root.selectedKey = Model.keyForDate(root.today)
-    root.refreshData(true)
+    today = new Date()
+    viewYear = today.getFullYear()
+    viewMonth = today.getMonth()
+    selectedKey = Model.keyForDate(today)
+    refreshData(true)
   }
-
   function refreshData(includeMetadata) {
-    root.requestEventRange()
-    if (includeMetadata || root.calendars.length === 0) {
-      root.calendarsLoading = true
-      root.calendarError = ""
-      root.latestCalendarsRequestId = root.enqueueRequest({ action: "calendars" })
-      root.enqueueRequest({ action: "status" })
-    }
+    requestEventRange()
+    if (includeMetadata) enqueueRequest({ action: "status" })
   }
-
   function requestEventRange() {
-    if (!root.weeks || root.weeks.length !== 6) return
-    var first = root.weeks[0].days[0].key
-    var lastCell = root.weeks[5].days[6]
-    root.listLoading = true
-    root.listError = ""
-    root.events = []
-    root.latestListRequestId = root.enqueueRequest({
-      action: "list",
-      start: first,
-      end: lastCell.key
-    })
+    if (!weeks || weeks.length !== 6) return
+    listLoading = true
+    listError = ""
+    events = []
+    latestListRequestId = enqueueRequest({ action: "list", start: weeks[0].days[0].key, end: weeks[5].days[6].key })
   }
-
   function enqueueRequest(request) {
-    if (root.setupBusy) {
-      root.failAction(String(request.action || ""), "Account setup is in progress")
-      return ""
-    }
-    if (root.helperPath === "") {
-      root.failAction(String(request.action || ""), "Calendar helper path is unavailable")
-      return ""
-    }
-    if (root.requestQueue.length >= root.maxQueuedRequests) {
-      root.failAction(String(request.action || ""), "Too many calendar requests")
-      return ""
-    }
-    root.requestSequence++
+    if (helperPath === "") { failRequest(String(request.action || ""), "Calendar helper is unavailable"); return "" }
+    if (requestQueue.length >= maxQueuedRequests) { failRequest(String(request.action || ""), "Too many calendar requests"); return "" }
+    requestSequence++
     var copy = {}
     for (var key in request) copy[key] = request[key]
-    copy.requestId = "qml-" + root.requestSequence
-    var next = root.requestQueue.slice()
-    next.push(copy)
-    root.requestQueue = next
-    root.startNextRequest()
+    copy.requestId = "qml-" + requestSequence
+    var next = requestQueue.slice(); next.push(copy); requestQueue = next
+    startNextRequest()
     return copy.requestId
   }
-
   function startNextRequest() {
-    if (root.setupBusy || requestProcess.running || root.activeRequest || root.requestQueue.length === 0) return
-    var queue = root.requestQueue.slice()
-    root.activeRequest = queue.shift()
-    root.requestQueue = queue
-    requestProcess.responseText = ""
-    requestProcess.errorText = ""
-    requestProcess.timedOut = false
-    requestProcess.command = [root.helperPath, "request"]
+    if (requestProcess.running || activeRequest || requestQueue.length === 0) return
+    var next = requestQueue.slice(); activeRequest = next.shift(); requestQueue = next
+    requestProcess.responseText = ""; requestProcess.errorText = ""; requestProcess.timedOut = false
+    requestProcess.command = [helperPath, "request"]
     requestProcess.running = true
   }
-
   function finishRequest(exitCode) {
-    requestTimeout.stop()
-    requestHardKill.stop()
-    var request = root.activeRequest
-    root.activeRequest = null
-    if (!request) {
-      root.startNextRequest()
-      return
-    }
+    requestTimeout.stop(); requestHardKill.stop()
+    var request = activeRequest; activeRequest = null
+    if (!request) { startNextRequest(); return }
     var action = String(request.action || "")
-    if (requestProcess.timedOut) {
-      root.failAction(action, "Calendar request timed out")
-      root.startNextRequest()
-      return
-    }
     var output = String(requestProcess.responseText || "")
-    if (output.length > root.maxResponseBytes) {
-      root.failAction(action, "Calendar response was too large")
-      root.startNextRequest()
-      return
+    if (requestProcess.timedOut) failRequest(action, "Calendar request timed out")
+    else if (output.length > maxResponseBytes) failRequest(action, "Calendar response was too large")
+    else if (exitCode !== 0) failRequest(action, String(requestProcess.errorText || "").trim() || "Calendar helper failed")
+    else {
+      var response = null
+      try { response = JSON.parse(output) } catch (error) {}
+      if (!response || typeof response !== "object" || Array.isArray(response)) failRequest(action, "Calendar helper returned invalid JSON")
+      else if (String(response.requestId || "") !== String(request.requestId)) failRequest(action, "Calendar response did not match its request")
+      else if (response.ok === false || response.error) failRequest(action, String(response.error && response.error.message || response.error || "Calendar request failed"))
+      else applyResponse(action, request.requestId, response.result !== undefined ? response.result : response)
     }
-    if (exitCode !== 0) {
-      var stderr = String(requestProcess.errorText || "").trim()
-      root.failAction(action, stderr || "Calendar helper failed")
-      root.startNextRequest()
-      return
-    }
-
-    var response = null
-    try { response = JSON.parse(output) }
-    catch (error) {
-      root.failAction(action, "Calendar helper returned invalid JSON")
-      root.startNextRequest()
-      return
-    }
-    if (!response || typeof response !== "object" || Array.isArray(response)) {
-      root.failAction(action, "Calendar helper returned an invalid response")
-      root.startNextRequest()
-      return
-    }
-    if (response.ok === false || response.error) {
-      var message = response.error && response.error.message ? response.error.message : response.error
-      root.failAction(action, String(message || "Calendar request failed"))
-      root.startNextRequest()
-      return
-    }
-    if (String(response.requestId || "") !== String(request.requestId)) {
-      root.failAction(action, "Calendar response did not match its request")
-      root.startNextRequest()
-      return
-    }
-    var body = response.result !== undefined ? response.result
-      : (response.data !== undefined ? response.data : response)
-    root.applyResponse(action, request.requestId, body)
-    root.startNextRequest()
+    startNextRequest()
   }
-
-  function failAction(action, message) {
-    if (action === "list") {
-      root.listLoading = false
-      root.listError = message
-    } else if (action === "calendars") {
-      root.calendarsLoading = false
-      root.calendarError = message
-    } else if (action === "create") {
-      root.createLoading = false
-      root.formError = message
-    } else if (action === "status") {
-      root.backendStatus = message
-    }
+  function failRequest(action, message) {
+    if (action === "list") { listLoading = false; listError = message }
+    else backendStatus = message
   }
-
   function applyResponse(action, requestId, body) {
     if (action === "list") {
-      if (requestId !== root.latestListRequestId) return
-      var rawEvents = Array.isArray(body) ? body : (body && Array.isArray(body.events) ? body.events : [])
-      root.events = Model.normalizeEvents(rawEvents)
-      root.listLoading = false
-      root.listError = ""
-    } else if (action === "calendars") {
-      if (requestId !== root.latestCalendarsRequestId) return
-      var rawCalendars = Array.isArray(body) ? body : (body && Array.isArray(body.calendars) ? body.calendars : [])
-      var clean = []
-      for (var i = 0; i < rawCalendars.length && clean.length < 100; i++) {
-        var calendar = rawCalendars[i]
-        if (!calendar || typeof calendar !== "object") continue
-        var id = String(calendar.id || calendar.calendarId || "").trim()
-        var name = String(calendar.name || calendar.calendarName || id).trim()
-        if (id !== "") clean.push({ id: id.substr(0, 200), name: name.substr(0, 200) })
-      }
-      root.calendars = clean
-      root.calendarsLoading = false
-      root.calendarError = clean.length === 0 ? "No writable calendars" : ""
+      if (requestId !== latestListRequestId) return
+      events = Model.normalizeEvents(body && Array.isArray(body.events) ? body.events : [])
+      listLoading = false; listError = ""
     } else if (action === "status") {
-      var account = body && body.remoteAccount && typeof body.remoteAccount === "object"
-        ? body.remoteAccount : {}
-      root.remoteAccount = {
-        connected: account.connected === true,
-        provider: String(account.provider || "").substr(0, 16),
-        displayName: String(account.displayName || "").substr(0, 256),
-        setupMode: account.setupMode === "replace" ? "replace" : "connect"
-      }
-      if (body && (body.configured === false || body.ready === false))
-        root.backendStatus = String(body.message || "Calendar setup is required")
-      else root.backendStatus = body && body.error ? String(body.error) : ""
-    } else if (action === "create") {
-      root.createLoading = false
-      root.addingEvent = false
-      root.formError = ""
-      root.requestEventRange()
+      subscriptions = Model.normalizeSubscriptionStatus(body && body.subscriptions, body && body.lastRefresh)
+      backendStatus = body && body.readOnly === true ? "" : "Calendar backend is not read-only"
     }
-  }
-
-  function calendarOptionsFor(values) {
-    var options = []
-    for (var i = 0; i < values.length; i++) options.push({ value: values[i].id, label: values[i].name })
-    return options
   }
 
   function moveMonth(delta) {
-    var next = Model.stepMonth(root.viewYear, root.viewMonth, delta)
-    root.viewYear = next.year
-    root.viewMonth = next.month
-    root.selectedKey = Model.dateKey(next.year, next.month, 1)
-    root.requestEventRange()
+    var next = Model.stepMonth(viewYear, viewMonth, delta)
+    viewYear = next.year; viewMonth = next.month; selectedKey = Model.dateKey(next.year, next.month, 1)
+    requestEventRange()
   }
-
   function selectDay(day) {
-    root.selectedKey = day.key
-    if (!day.inMonth) {
-      root.viewYear = day.year
-      root.viewMonth = day.month
-      root.requestEventRange()
-    }
+    selectedKey = day.key
+    if (!day.inMonth) { viewYear = day.year; viewMonth = day.month; requestEventRange() }
   }
-
   function moveSelection(days) {
-    var parts = root.selectedKey.split("-")
-    if (parts.length !== 3) return
+    var parts = selectedKey.split("-"); if (parts.length !== 3) return
     var date = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]) + days)
-    var monthChanged = date.getFullYear() !== root.viewYear || date.getMonth() !== root.viewMonth
-    root.selectedKey = Model.keyForDate(date)
-    if (monthChanged) {
-      root.viewYear = date.getFullYear()
-      root.viewMonth = date.getMonth()
-      root.requestEventRange()
+    selectedKey = Model.keyForDate(date)
+    if (date.getFullYear() !== viewYear || date.getMonth() !== viewMonth) {
+      viewYear = date.getFullYear(); viewMonth = date.getMonth(); requestEventRange()
     }
   }
-
   function toggleWeekStart() {
-    var next = Model.toggledWeekStart(root.weekStart)
-    var entry = { id: root.moduleName }
-    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
-    entry.weekStartDay = Model.weekStartSettingName(next)
-    root.settings = entry
-    if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry
-    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
-      root.bar.shell.updateEntryInline(root.moduleName, entry)
+    var next = Model.toggledWeekStart(weekStart)
+    var entry = { id: moduleName }
+    for (var key in settings) if (key !== "id") entry[key] = settings[key]
+    entry.weekStartDay = Model.weekStartSettingName(next); settings = entry
+    if (hostWidget && "settings" in hostWidget) hostWidget.settings = entry
+    if (bar && bar.shell && typeof bar.shell.updateEntryInline === "function") bar.shell.updateEntryInline(moduleName, entry)
   }
-
-  function weekdayLabel(day) {
-    return String(Qt.locale().dayName(day, Locale.ShortFormat)).replace(/\.$/, "").toUpperCase()
-  }
-
-  function startAdd() {
-    if (root.setupBusy) return
-    root.closeSetupForm()
-    root.addingEvent = true
-    root.formError = ""
-    eventCalendar.value = root.calendars.length > 0 ? root.calendars[0].id : ""
-    eventTitle.text = ""
-    eventDate.text = root.selectedKey
-    eventStart.text = "09:00"
-    eventEnd.text = "10:00"
-    Qt.callLater(function() { eventTitle.forceActiveFocus() })
-  }
-
-  function cancelAdd() {
-    if (root.createLoading) return
-    root.addingEvent = false
-    root.createLoading = false
-    root.formError = ""
-    if (eventCalendar.popupOpen) eventCalendar.close()
-    Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
-  }
-
-  function submitAdd() {
-    if (root.createLoading || root.setupBusy) return
-    var checked = Model.validateCreateInput({
-      calendarId: eventCalendar.value,
-      title: eventTitle.text,
-      date: eventDate.text,
-      start: eventStart.text,
-      end: eventEnd.text
-    })
-    if (!checked.valid) {
-      root.formError = checked.error
-      return
-    }
-    root.formError = ""
-    root.createLoading = true
-    var request = { action: "create" }
-    for (var key in checked.value) request[key] = checked.value[key]
-    root.enqueueRequest(request)
-  }
-
-  function startAccountSetup() {
-    if (root.createLoading || root.setupBusy) return
-    root.cancelAdd()
-    root.addingAccount = true
-    root.setupState = "idle"
-    root.setupStage = ""
-    root.setupMessage = ""
-    root.setupError = ""
-    root.setupWarning = ""
-    root.setupBrowserUrl = ""
-    root.setupReplacesExisting = root.remoteAccount.setupMode === "replace"
-    setupProvider.value = "google"
-    setupDisplayName.text = ""
-    setupUsername.text = ""
-    setupUrl.text = ""
-    setupClientId.text = ""
-    setupSecret.text = ""
-    root.setupClientFilePath = ""
-    Qt.callLater(function() { setupProvider.forceActiveFocus() })
-  }
-
-  function clearSetupSecret() {
-    setupSecret.text = ""
-    setupProcess.requestText = ""
-  }
-
-  function openGoogleClientFilePicker() {
-    if (root.setupBusy || googleClientPickerProcess.running) return
-    var home = Quickshell.env("HOME") || ""
-    var command = [
-      "/usr/bin/zenity",
-      "--file-selection",
-      "--title=Import Google Desktop OAuth JSON",
-      "--file-filter=JSON files | *.json"
-    ]
-    if (home !== "") command.push("--filename=" + home + "/Downloads/")
-    root.googleClientPickerOpen = true
-    googleClientPickerProcess.outputText = ""
-    googleClientPickerProcess.command = command
-    root.setCenterHoverRevealSuppressed(false)
-    root.controller.hide()
-    googleClientPickerProcess.running = true
-  }
-
-  function finishGoogleClientFilePicker(exitCode) {
-    root.googleClientPickerOpen = false
-    var output = googleClientPickerProcess.outputText
-    googleClientPickerProcess.outputText = ""
-    if (exitCode === 0) {
-      if (output.length > 4097) {
-        root.setupError = "Selected credential path is too long"
-      } else {
-        root.acceptGoogleClientFile(output.replace(/\r?\n$/, ""))
-      }
-    } else if (exitCode !== 1) {
-      root.setupError = "Unable to open the external file picker"
-    }
-    root.controller.show()
-    Qt.callLater(function() {
-      if (!root.opened) return
-      root.setCenterHoverRevealSuppressed(true)
-      if (keyCatcher) keyCatcher.forceActiveFocus()
-    })
-  }
-
-  function acceptGoogleClientFile(fileUrl) {
-    if (root.setupBusy || setupProvider.value !== "google") return
-    var path = Model.localPathForUrl(String(fileUrl || ""))
-    if (path === "") {
-      root.setupError = "Choose one local JSON file"
-      return
-    }
-    setupClientId.text = ""
-    setupSecret.text = ""
-    root.resetSetupFeedback()
-    root.setupClientFilePath = path
-    root.setupMessage = "Desktop OAuth JSON selected. Click Connect to continue."
-  }
-
-  function closeSetupForm() {
-    if (root.setupBusy) return
-    root.clearSetupSecret()
-    root.setupClientFilePath = ""
-    root.addingAccount = false
-    root.setupState = "idle"
-    root.setupStage = ""
-    root.setupMessage = ""
-    root.setupError = ""
-    root.setupWarning = ""
-    root.setupBrowserUrl = ""
-    if (setupProvider.popupOpen) setupProvider.close()
-    Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
-  }
-
-  function resetSetupFeedback() {
-    if (root.setupBusy) return
-    root.setupState = "idle"
-    root.setupStage = ""
-    root.setupMessage = ""
-    root.setupError = ""
-    root.setupWarning = ""
-    root.setupBrowserUrl = ""
-  }
-
-  function submitAccountSetup() {
-    if (root.setupBusy) return
-    if (root.requestBusy) {
-      root.setupError = "Wait for the current calendar operation to finish"
-      return
-    }
-    if (root.helperPath === "") {
-      root.setupError = "Calendar helper path is unavailable"
-      return
-    }
-    var checked = Model.validateSetupInput({
-      provider: setupProvider.value,
-      displayName: setupDisplayName.text,
-      username: setupUsername.text,
-      url: setupUrl.text,
-      clientId: setupClientId.text,
-      clientFile: root.setupClientFilePath,
-      secret: setupSecret.text
-    })
-    if (!checked.valid) {
-      root.setupError = checked.error
-      return
-    }
-
-    root.setupSequence++
-    root.activeSetupRequestId = "setup-qml-" + root.setupSequence
-    checked.value.requestId = root.activeSetupRequestId
-    setupProcess.requestText = JSON.stringify(checked.value)
-    checked.value.secret = ""
-    root.setupState = "running"
-    root.setupStage = "starting"
-    root.setupMessage = "Starting account setup…"
-    root.setupError = ""
-    root.setupWarning = ""
-    root.setupBrowserUrl = ""
-    root.setupCancelled = false
-    root.setupTimedOut = false
-    root.setupProtocolError = false
-    root.setupFinalResponse = null
-    root.setupResponseCharacters = 0
-    root.setupResponseLines = 0
-    root.setupReplacesExisting = root.remoteAccount.setupMode === "replace"
-    setupProcess.command = [root.helperPath, "setup-request"]
-    setupProcess.running = true
-  }
-
-  function failSetupProtocol(message) {
-    root.setupProtocolError = true
-    root.setupError = message
-    if (setupProcess.running) setupProcess.signal(15)
-    setupHardKill.restart()
-  }
-
-  function acceptSetupLine(data) {
-    if (!root.setupBusy || root.setupProtocolError) return
-    var line = String(data || "")
-    root.setupResponseCharacters += line.length + 1
-    root.setupResponseLines++
-    if (line.length === 0 || line.length > 16384
-        || root.setupResponseCharacters > root.maxSetupResponseCharacters
-        || root.setupResponseLines > root.maxSetupResponseLines) {
-      root.failSetupProtocol("Calendar setup returned too much data")
-      return
-    }
-    var parsed = Model.parseSetupProtocolLine(line, root.activeSetupRequestId, {
-      browserSeen: root.setupBrowserUrl !== "",
-      finalSeen: root.setupFinalResponse !== null
-    })
-    if (!parsed.valid) {
-      root.failSetupProtocol(parsed.error || "Calendar setup returned invalid data")
-      return
-    }
-    var response = parsed.response
-    if (parsed.kind === "progress") {
-      root.setupStage = String(response.stage || "").substr(0, 32)
-      root.setupMessage = String(response.message || "Working…").substr(0, 500)
-      if (response.replacesExisting === true) root.setupReplacesExisting = true
-    } else if (parsed.kind === "browser") {
-      root.setupBrowserUrl = String(response.url)
-      root.setupMessage = "Complete authorization in your browser"
-      Qt.openUrlExternally(root.setupBrowserUrl)
-    } else if (parsed.kind === "result") {
-      root.setupFinalResponse = {
-        ok: response.ok === true,
-        replacesExisting: response.replacesExisting === true,
-        cleanupComplete: response.cleanupComplete !== false,
-        errorMessage: response.error && response.error.message
-          ? String(response.error.message).substr(0, 500) : ""
-      }
-      if (response.replacesExisting === true) root.setupReplacesExisting = true
-      root.setupMessage = response.ok === true ? "Finishing setup…" : ""
-    }
-  }
-
-  function cancelAccountSetup() {
-    if (!root.setupBusy) {
-      root.closeSetupForm()
-      return
-    }
-    if (!setupProcess.running || root.setupStage === "committing" || root.setupState === "cancelling") return
-    root.setupCancelled = true
-    root.setupState = "cancelling"
-    root.setupMessage = "Cancelling account setup…"
-    setupProcess.signal(15)
-    setupHardKill.restart()
-  }
-
-  function finishAccountSetup(exitCode) {
-    setupWatchdog.stop()
-    setupHardKill.stop()
-    root.clearSetupSecret()
-    var finalResponse = root.setupFinalResponse
-    root.setupFinalResponse = null
-
-    if (root.setupProtocolError) {
-      root.setupState = "error"
-      root.setupMessage = ""
-      if (root.setupError === "") root.setupError = "Calendar setup returned invalid data"
-      return
-    }
-    var presentation = Model.setupResultPresentation(finalResponse, root.setupCancelled)
-    if (presentation !== null) {
-      root.setupState = presentation.state
-      root.setupMessage = presentation.message
-      root.setupWarning = presentation.warning
-      root.setupError = ""
-      if (presentation.state === "success") root.refreshData(true)
-      return
-    }
-    if (root.setupTimedOut) {
-      root.setupState = "error"
-      root.setupMessage = ""
-      root.setupError = "Account setup timed out after 11 minutes"
-      return
-    }
-    if (exitCode !== 0 || finalResponse === null) {
-      root.setupState = "error"
-      root.setupMessage = ""
-      root.setupError = exitCode !== 0 ? "Calendar setup helper failed" : "Calendar setup ended without a result"
-      return
-    }
-    root.setupState = "error"
-    root.setupMessage = ""
-    root.setupError = finalResponse.errorMessage || "Account setup failed"
-  }
-
+  function weekdayLabel(day) { return String(Qt.locale().dayName(day, Locale.ShortFormat)).replace(/\.$/, "").toUpperCase() }
   function eventTime(event) {
     if (event.allDay) return "ALL DAY"
-    var start = new Date(event.start)
-    var end = new Date(event.end)
+    var start = new Date(event.start); var end = new Date(event.end)
     if (!isFinite(start.getTime()) || !isFinite(end.getTime())) return ""
     return Qt.formatTime(start, "HH:mm") + "–" + Qt.formatTime(end, "HH:mm")
   }
 
-  Process {
-    id: googleClientPickerProcess
-    property string outputText: ""
+  function openSettings() {
+    settingsOpen = true; addFormOpen = false; subscriptionError = ""
+    startSubscription({ action: "list" }, "Loading subscriptions…")
+  }
+  function clearCredentialFields() {
+    feedUrl.text = ""; feedPassword.text = ""; subscriptionRequestText = ""
+  }
+  function submitSubscription() {
+    var checked = Model.validateSubscriptionInput({ name: feedName.text, url: feedUrl.text, username: feedUsername.text, password: feedPassword.text, color: feedColor.text })
+    if (!checked.valid) { subscriptionError = checked.error; return }
+    startSubscription(checked.value, "Adding subscription…")
+  }
+  function removeSubscription(id) { startSubscription({ action: "remove", id: id }, "Removing subscription…") }
+  function refreshSubscriptions() { startSubscription({ action: "refresh" }, "Refreshing subscriptions…") }
+  function startSubscription(request, message) {
+    if (subscriptionBusy || helperPath === "") return
+    subscriptionSequence++
+    subscriptionRequestId = "subscription-qml-" + subscriptionSequence
+    request.requestId = subscriptionRequestId
+    subscriptionAction = request.action
+    subscriptionRequestText = JSON.stringify(request)
+    request.url = ""; request.password = ""
+    subscriptionState = "running"; subscriptionMessage = message; subscriptionError = ""
+    subscriptionProtocolState = { finalSeen: false, progressCount: 0 }
+    subscriptionResponseCharacters = 0; subscriptionResponseLines = 0
+    subscriptionTimedOut = false; subscriptionCancelled = false
+    subscriptionProcess.command = [helperPath, "subscriptions"]
+    subscriptionProcess.running = true
+  }
+  function acceptSubscriptionLine(data) {
+    var line = String(data || "")
+    subscriptionResponseCharacters += line.length + 1; subscriptionResponseLines++
+    if (line.length === 0 || line.length > 16384 || subscriptionResponseCharacters > 65536 || subscriptionResponseLines > 64) {
+      failSubscriptionProtocol("Subscription helper returned too much data"); return
+    }
+    var parsed = Model.parseSubscriptionProtocolLine(line, subscriptionRequestId, subscriptionProtocolState)
+    if (!parsed.valid) { failSubscriptionProtocol(parsed.error); return }
+    subscriptionProtocolState = parsed.state
+    if (parsed.kind === "progress") subscriptionMessage = String(parsed.response.stage || "Working…").replace(/^./, function(c) { return c.toUpperCase() }) + "…"
+    else {
+      var response = parsed.response
+      if (response.ok !== true) subscriptionError = String(response.error && response.error.message || "Subscription operation failed").substr(0, 500)
+      else {
+        subscriptionState = "success"; subscriptionMessage = subscriptionAction === "refresh" ? "Subscriptions refreshed" : "Subscription updated"
+        if (Array.isArray(response.subscriptions)) subscriptions = Model.normalizeSubscriptionStatus(response.subscriptions, null)
+        if (response.refresh) subscriptions = Model.normalizeSubscriptionStatus(subscriptions, response.refresh)
+      }
+    }
+  }
+  function failSubscriptionProtocol(message) {
+    subscriptionError = message || "Subscription helper returned invalid data"
+    if (subscriptionProcess.running) subscriptionProcess.signal(15)
+    subscriptionHardKill.restart()
+  }
+  function cancelSubscription() {
+    if (!subscriptionBusy || !subscriptionProcess.running) return
+    subscriptionCancelled = true; subscriptionState = "cancelling"; subscriptionMessage = "Cancelling subscription operation…"
+    subscriptionProcess.signal(15); subscriptionHardKill.restart()
+  }
+  function finishSubscription(exitCode) {
+    subscriptionWatchdog.stop(); subscriptionHardKill.stop(); clearCredentialFields()
+    if (subscriptionCancelled) { subscriptionState = "cancelled"; subscriptionMessage = "Subscription operation cancelled" }
+    else if (subscriptionTimedOut) { subscriptionState = "error"; subscriptionError = "Subscription operation timed out" }
+    else if (!subscriptionProtocolState.finalSeen) { subscriptionState = "error"; if (subscriptionError === "") subscriptionError = exitCode === 0 ? "Subscription helper ended without a result" : "Subscription helper failed" }
+    else if (subscriptionError !== "") subscriptionState = "error"
+    if (subscriptionState === "success") {
+      addFormOpen = false; feedName.text = ""; feedUsername.text = ""; feedColor.text = ""
+      refreshData(true)
+      if (subscriptionAction !== "list") Qt.callLater(function() { startSubscription({ action: "list" }, "Updating subscriptions…") })
+    }
+  }
+  function launchThunderbird() {
+    if (thunderbirdProcess.running) return
+    thunderbirdError = ""
+    thunderbirdProcess.command = ["thunderbird", "-calendar"]
+    thunderbirdProcess.running = true
+  }
 
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: googleClientPickerProcess.outputText = String(text || "")
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: function() { /* Deliberately discard picker diagnostics. */ }
-    }
-    onExited: function(exitCode) {
-      Qt.callLater(function() { root.finishGoogleClientFilePicker(exitCode) })
-    }
+  Component.onDestruction: {
+    if (requestProcess.running) requestProcess.signal(15)
+    if (subscriptionProcess.running) subscriptionProcess.signal(15)
   }
 
   Process {
@@ -677,97 +278,44 @@ Panel {
     property string errorText: ""
     property bool timedOut: false
     stdinEnabled: true
-
-    onStarted: {
-      requestTimeout.restart()
-      write(JSON.stringify(root.activeRequest) + "\n")
-    }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: requestProcess.responseText = String(text || "")
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: requestProcess.errorText = String(text || "")
-    }
-    onExited: function(exitCode) {
-      Qt.callLater(function() { root.finishRequest(exitCode) })
-    }
+    onStarted: { requestTimeout.restart(); write(JSON.stringify(root.activeRequest) + "\n") }
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: requestProcess.responseText = String(text || "") }
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: requestProcess.errorText = String(text || "") }
+    onExited: function(exitCode) { Qt.callLater(function() { root.finishRequest(exitCode) }) }
   }
-
-  Timer {
-    id: requestTimeout
-    interval: 45000
-    repeat: false
-    onTriggered: {
-      if (!requestProcess.running) return
-      requestProcess.timedOut = true
-      requestProcess.signal(15)
-      requestHardKill.restart()
-    }
-  }
-
-  Timer {
-    id: requestHardKill
-    interval: 1500
-    repeat: false
-    onTriggered: if (requestProcess.running) requestProcess.signal(9)
-  }
+  Timer { id: requestTimeout; interval: 45000; onTriggered: { if (requestProcess.running) { requestProcess.timedOut = true; requestProcess.signal(15); requestHardKill.restart() } } }
+  Timer { id: requestHardKill; interval: 1500; onTriggered: if (requestProcess.running) requestProcess.signal(9) }
 
   Process {
-    id: setupProcess
-    property string requestText: ""
+    id: subscriptionProcess
     stdinEnabled: true
-
     onStarted: {
-      setupWatchdog.restart()
-      var outgoing = setupProcess.requestText
+      subscriptionWatchdog.restart()
+      var outgoing = root.subscriptionRequestText
       write(outgoing + "\n")
       outgoing = ""
-      root.clearSetupSecret()
-      root.setupClientFilePath = ""
+      root.clearCredentialFields()
     }
-    stdout: SplitParser {
-      splitMarker: "\n"
-      onRead: function(data) { root.acceptSetupLine(data) }
-    }
-    stderr: SplitParser {
-      splitMarker: "\n"
-      onRead: function(data) { /* Deliberately discard helper diagnostics. */ }
-    }
-    onExited: function(exitCode) {
-      Qt.callLater(function() { root.finishAccountSetup(exitCode) })
-    }
+    stdout: SplitParser { splitMarker: "\n"; onRead: function(data) { root.acceptSubscriptionLine(data) } }
+    stderr: SplitParser { splitMarker: "\n"; onRead: function(data) {} }
+    onExited: function(exitCode) { Qt.callLater(function() { root.finishSubscription(exitCode) }) }
   }
-
   Timer {
-    id: setupWatchdog
-    interval: 660000
-    repeat: false
-    onTriggered: {
-      if (!setupProcess.running) return
-      root.setupTimedOut = true
-      root.setupState = "cancelling"
-      root.setupMessage = "Stopping account setup…"
-      setupProcess.signal(15)
-      setupHardKill.restart()
-    }
+    id: subscriptionWatchdog; interval: 660000
+    onTriggered: { if (subscriptionProcess.running) { root.subscriptionTimedOut = true; root.subscriptionState = "cancelling"; subscriptionProcess.signal(15); subscriptionHardKill.restart() } }
   }
+  Timer { id: subscriptionHardKill; interval: 30000; onTriggered: if (subscriptionProcess.running) subscriptionProcess.signal(9) }
 
-  Timer {
-    id: setupHardKill
-    interval: 30000
-    repeat: false
-    onTriggered: if (setupProcess.running) setupProcess.signal(9)
+  Process {
+    id: thunderbirdProcess
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: function() {} }
+    onExited: function(exitCode) { if (exitCode !== 0) root.thunderbirdError = "Unable to open Thunderbird Calendar" }
   }
 
   SystemClock {
     id: clock
     precision: SystemClock.Minutes
-    onDateChanged: {
-      if (Model.keyForDate(clock.date) === root.todayKey) return
-      root.today = clock.date
-    }
+    onDateChanged: if (Model.keyForDate(clock.date) !== root.todayKey) root.today = clock.date
   }
 
   KeyboardPanel {
@@ -784,7 +332,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.addingEvent || root.addingAccount || eventCalendar.popupOpen || setupProvider.popupOpen
+      blocked: root.settingsOpen
       onMoveRequested: function(dx, dy) { root.moveSelection(dx + dy * 7) }
       onActivateRequested: root.selectedKey = root.todayKey
       onCloseRequested: root.close()
@@ -792,13 +340,6 @@ Panel {
       onTextKey: function(text) {
         if (text === "[") root.moveMonth(-1)
         else if (text === "]") root.moveMonth(1)
-        else if (text === "t" || text === "T") {
-          root.viewYear = root.today.getFullYear()
-          root.viewMonth = root.today.getMonth()
-          root.selectedKey = root.todayKey
-          root.requestEventRange()
-        } else if (text === "a" || text === "A") root.startAdd()
-        else if (text === "c" || text === "C") root.startAccountSetup()
         else if (text === "r" || text === "R") root.refreshData(true)
       }
 
@@ -815,130 +356,50 @@ Panel {
           spacing: Style.space(10)
 
           Item {
-            width: parent.width
-            height: monthNavigation.implicitHeight
-
+            width: parent.width; height: monthNavigation.implicitHeight
             Row {
-              id: monthNavigation
-              anchors.horizontalCenter: parent.horizontalCenter
-              spacing: Style.space(12)
-
-              Button {
-                iconText: "󰅁"
-                tooltipText: "Previous month"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                focusable: true
-                onClicked: root.moveMonth(-1)
-              }
+              id: monthNavigation; anchors.horizontalCenter: parent.horizontalCenter; spacing: Style.space(12)
+              Button { iconText: "󰅁"; tooltipText: "Previous month"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; onClicked: root.moveMonth(-1) }
               Text {
-                width: Style.space(230)
-                anchors.verticalCenter: parent.verticalCenter
-                horizontalAlignment: Text.AlignHCenter
-                text: Qt.formatDate(root.viewDate, "MMMM yyyy").toUpperCase()
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.title
-                font.bold: true
-                font.letterSpacing: 1
+                width: Style.space(230); anchors.verticalCenter: parent.verticalCenter; horizontalAlignment: Text.AlignHCenter
+                text: Qt.formatDate(root.viewDate, "MMMM yyyy").toUpperCase(); color: root.contentForeground
+                font.family: root.contentFontFamily; font.pixelSize: Style.font.title; font.bold: true; font.letterSpacing: 1
               }
-              Button {
-                iconText: "󰅂"
-                tooltipText: "Next month"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                focusable: true
-                onClicked: root.moveMonth(1)
-              }
+              Button { iconText: "󰅂"; tooltipText: "Next month"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; onClicked: root.moveMonth(1) }
             }
-
             Button {
-              anchors.right: parent.right
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              iconText: "󰒓"
-              tooltipText: "Calendar settings"
-              foreground: root.contentForeground
-              fontFamily: root.contentFontFamily
-              bordered: false
-              focusable: true
-              enabled: !root.anyOperationBusy && !root.addingAccount && !root.addingEvent
-              onClicked: root.startAccountSetup()
+              anchors.right: parent.right; anchors.rightMargin: Style.space(8); anchors.verticalCenter: parent.verticalCenter
+              iconText: "󰒓"; tooltipText: "ICS subscriptions"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; bordered: false
+              onClicked: if (root.settingsOpen) { root.settingsOpen = false; root.clearCredentialFields() } else root.openSettings()
             }
           }
 
           Column {
-            id: monthGrid
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: root.cellSpacing
-
+            id: monthGrid; visible: !root.settingsOpen; anchors.horizontalCenter: parent.horizontalCenter; spacing: root.cellSpacing
             Row {
               spacing: root.cellSpacing
-              Repeater {
-                model: root.weekdays
-                Text {
-                  required property var modelData
-                  width: root.cellWidth
-                  height: Style.space(18)
-                  horizontalAlignment: Text.AlignHCenter
-                  text: root.weekdayLabel(modelData)
-                  color: Qt.darker(root.contentForeground, 1.5)
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.caption
-                  font.bold: true
-                }
-              }
+              Repeater { model: root.weekdays; Text { required property var modelData; width: root.cellWidth; height: Style.space(18); horizontalAlignment: Text.AlignHCenter; text: root.weekdayLabel(modelData); color: Qt.darker(root.contentForeground, 1.5); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption; font.bold: true } }
             }
-
             Repeater {
               model: root.weeks
               Row {
-                required property var modelData
-                spacing: root.cellSpacing
+                required property var modelData; spacing: root.cellSpacing
                 Repeater {
                   model: modelData.days
                   Rectangle {
                     id: dayCell
                     required property var modelData
                     readonly property var dayEvents: root.eventsByDate[modelData.key] || []
-                    width: root.cellWidth
-                    height: root.cellHeight
-                    radius: Style.cornerRadius
-                    color: modelData.key === root.selectedKey
-                      ? Style.selectedFillFor(root.contentForeground, Color.accent) : "transparent"
+                    width: root.cellWidth; height: root.cellHeight; radius: Style.cornerRadius
+                    color: modelData.key === root.selectedKey ? Style.selectedFillFor(root.contentForeground, Color.accent) : "transparent"
                     border.width: modelData.today || modelData.key === root.selectedKey ? Style.spacing.hairline : 0
                     border.color: Style.normalBorderFor(root.contentForeground, Color.accent)
-
-                    Text {
-                      anchors.horizontalCenter: parent.horizontalCenter
-                      y: Style.space(3)
-                      text: dayCell.modelData.day
-                      color: dayCell.modelData.inMonth ? root.contentForeground : Qt.darker(root.contentForeground, 2.1)
-                      font.family: root.contentFontFamily
-                      font.pixelSize: Style.font.body
-                      font.bold: dayCell.modelData.today || dayCell.modelData.key === root.selectedKey
-                    }
+                    Text { anchors.horizontalCenter: parent.horizontalCenter; y: Style.space(3); text: dayCell.modelData.day; color: dayCell.modelData.inMonth ? root.contentForeground : Qt.darker(root.contentForeground, 2.1); font.family: root.contentFontFamily; font.pixelSize: Style.font.body; font.bold: dayCell.modelData.today || dayCell.modelData.key === root.selectedKey }
                     Row {
-                      anchors.horizontalCenter: parent.horizontalCenter
-                      anchors.bottom: parent.bottom
-                      anchors.bottomMargin: Style.space(4)
-                      spacing: Style.space(2)
-                      Repeater {
-                        model: Math.min(3, dayCell.dayEvents.length)
-                        Rectangle {
-                          required property int index
-                          width: Style.space(4)
-                          height: width
-                          radius: width / 2
-                          color: dayCell.dayEvents[index].color
-                        }
-                      }
+                      anchors.horizontalCenter: parent.horizontalCenter; anchors.bottom: parent.bottom; anchors.bottomMargin: Style.space(4); spacing: Style.space(2)
+                      Repeater { model: Math.min(3, dayCell.dayEvents.length); Rectangle { required property int index; width: Style.space(4); height: width; radius: width / 2; color: dayCell.dayEvents[index].color } }
                     }
-                    MouseArea {
-                      anchors.fill: parent
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: root.selectDay(dayCell.modelData)
-                    }
+                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: root.selectDay(dayCell.modelData) }
                   }
                 }
               }
@@ -946,492 +407,75 @@ Panel {
           }
 
           Item {
-            width: monthGrid.width
-            height: upcomingHeading.implicitHeight
-            anchors.horizontalCenter: parent.horizontalCenter
-
-            Text {
-              id: upcomingHeading
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              text: "UPCOMING FROM " + root.selectedKey
-              color: Qt.darker(root.contentForeground, 1.35)
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1
-            }
-
+            visible: !root.settingsOpen; width: monthGrid.width; height: upcomingHeading.implicitHeight; anchors.horizontalCenter: parent.horizontalCenter
+            Text { id: upcomingHeading; anchors.left: parent.left; text: "UPCOMING FROM " + root.selectedKey; color: Qt.darker(root.contentForeground, 1.35); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1 }
             Button {
-              id: addEventButton
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              iconText: "+"
-              tooltipText: "Add event"
-              foreground: root.contentForeground
-              fontFamily: root.contentFontFamily
-              bordered: false
-              focusable: true
-              enabled: !root.anyOperationBusy && !root.addingAccount && !root.addingEvent
-                && !root.calendarsLoading && root.calendars.length > 0
-              onClicked: root.startAdd()
+              anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; iconText: "+"
+              tooltipText: "Open Thunderbird Calendar"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; bordered: false
+              onClicked: root.launchThunderbird()
             }
           }
-
-          Text {
-            visible: root.listLoading
-            width: monthGrid.width
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: "Loading events…"
-            color: Qt.darker(root.contentForeground, 1.4)
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.body
-          }
-
+          Text { visible: !root.settingsOpen && root.thunderbirdError !== ""; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: root.thunderbirdError; color: Color.urgent; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
+          Text { visible: !root.settingsOpen && root.listLoading; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: "Loading events…"; color: Qt.darker(root.contentForeground, 1.4); font.family: root.contentFontFamily }
+          Text { visible: !root.settingsOpen && !root.listLoading && root.listError !== ""; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: root.listError; wrapMode: Text.Wrap; color: Color.urgent; font.family: root.contentFontFamily }
+          Text { visible: !root.settingsOpen && !root.listLoading && root.listError === "" && root.agendaEvents.length === 0; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: "No upcoming events in this view"; color: Qt.darker(root.contentForeground, 1.5); font.family: root.contentFontFamily }
           Column {
-            visible: !root.listLoading && root.listError !== ""
-            width: monthGrid.width
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.space(4)
-            Text {
-              width: parent.width
-              text: root.listError
-              wrapMode: Text.Wrap
-              color: Color.urgent
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.body
-            }
-            Button {
-              text: "Retry"
-              foreground: root.contentForeground
-              fontFamily: root.contentFontFamily
-              bordered: true
-              focusable: true
-              onClicked: root.requestEventRange()
-            }
-          }
-
-          Text {
-            visible: !root.listLoading && root.listError === "" && root.agendaEvents.length === 0
-            width: monthGrid.width
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: "No upcoming events in this view"
-            color: Qt.darker(root.contentForeground, 1.5)
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.body
-          }
-
-          Column {
-            visible: !root.listLoading && root.listError === ""
-            width: monthGrid.width
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.space(5)
+            visible: !root.settingsOpen && !root.listLoading && root.listError === ""; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; spacing: Style.space(5)
             Repeater {
               model: root.agendaEvents
               Rectangle {
-                required property var modelData
-                width: parent.width
-                height: agendaRow.implicitHeight + Style.space(10)
-                radius: Style.cornerRadius
+                required property var modelData; width: parent.width; height: agendaRow.implicitHeight + Style.space(10); radius: Style.cornerRadius
                 color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.055)
-                Rectangle {
-                  width: Style.space(4)
-                  height: parent.height
-                  radius: parent.radius
-                  color: modelData.color
-                }
+                Rectangle { width: Style.space(4); height: parent.height; radius: parent.radius; color: modelData.color }
                 Row {
-                  id: agendaRow
-                  anchors.left: parent.left
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  anchors.leftMargin: Style.space(12)
-                  anchors.rightMargin: Style.space(8)
-                  spacing: Style.space(8)
-                  Text {
-                    width: Style.space(92)
-                    text: modelData.startKey + "\n" + root.eventTime(modelData)
-                    color: Qt.darker(root.contentForeground, 1.35)
-                    font.family: root.contentFontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-                  Text {
-                    width: parent.width - Style.space(100)
-                    text: modelData.title + "\n" + modelData.calendarName
-                    elide: Text.ElideRight
-                    color: root.contentForeground
-                    font.family: root.contentFontFamily
-                    font.pixelSize: Style.font.body
-                  }
+                  id: agendaRow; anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; anchors.leftMargin: Style.space(12); anchors.rightMargin: Style.space(8); spacing: Style.space(8)
+                  Text { width: Style.space(92); text: modelData.startKey + "\n" + root.eventTime(modelData); color: Qt.darker(root.contentForeground, 1.35); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption }
+                  Text { width: parent.width - Style.space(100); text: modelData.title + "\n" + modelData.calendarName; elide: Text.ElideRight; color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.body }
                 }
               }
             }
           }
 
           Column {
-            visible: root.addingAccount
-            width: monthGrid.width
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.space(7)
-            Keys.onEscapePressed: {
-              if (root.setupBusy) root.close()
-              else root.closeSetupForm()
-            }
-
-            Text {
-              text: "ADD CALENDAR ACCOUNT"
-              color: root.contentForeground
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-              font.letterSpacing: 1
-            }
-            Text {
-              width: parent.width
-              text: root.setupReplacesExisting || root.remoteAccount.setupMode === "replace"
-                ? "This setup replaces the existing remote account"
-                  + (root.remoteAccount.displayName !== "" ? " (“" + root.remoteAccount.displayName + "”)" : "")
-                  + ". Only one remote account is supported; this does not add a second account."
-                : "Connect one remote calendar account."
-              wrapMode: Text.Wrap
-              textFormat: Text.PlainText
-              color: root.setupReplacesExisting || root.remoteAccount.setupMode === "replace"
-                ? Color.urgent : Qt.darker(root.contentForeground, 1.35)
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-            Dropdown {
-              id: setupProvider
-              width: parent.width
-              label: "Provider"
-              value: "google"
-              options: [
-                { value: "google", label: "Google" },
-                { value: "icloud", label: "iCloud" },
-                { value: "caldav", label: "Generic CalDAV" }
-              ]
-              foreground: root.contentForeground
-              fontFamily: root.contentFontFamily
-              enabled: !root.setupBusy
-              onChanged: function(value) {
-                setupSecret.text = ""
-                root.setupClientFilePath = ""
-                root.resetSetupFeedback()
+            visible: root.settingsOpen; width: Style.space(410); anchors.horizontalCenter: parent.horizontalCenter; spacing: Style.space(7)
+            Text { text: "ICS SUBSCRIPTIONS"; color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.body; font.bold: true; font.letterSpacing: 1 }
+            Text { width: parent.width; text: "Private feed URLs and optional credentials are stored in Secret Service. URLs are never shown after saving. Maximum 16 subscriptions."; wrapMode: Text.Wrap; color: Qt.darker(root.contentForeground, 1.3); font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
+            Text { width: parent.width; text: "Google Calendar: Settings → Integrate calendar → Secret address in iCal format."; wrapMode: Text.Wrap; color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
+            Repeater {
+              model: root.subscriptions
+              Rectangle {
+                required property var modelData; width: parent.width; height: Style.space(42); radius: Style.cornerRadius
+                color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.055)
+                Rectangle { width: Style.space(4); height: parent.height; radius: parent.radius; color: modelData.color || "#7aa2f7" }
+                Text { anchors.left: parent.left; anchors.leftMargin: Style.space(12); anchors.verticalCenter: parent.verticalCenter; width: parent.width - removeButton.width - Style.space(24); text: modelData.name + "  ·  " + modelData.statusText; elide: Text.ElideRight; color: modelData.status === "error" ? Color.urgent : root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
+                Button { id: removeButton; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: "Remove"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; enabled: !root.subscriptionBusy; onClicked: root.removeSubscription(modelData.id) }
               }
             }
-            Text {
-              width: parent.width
-              text: setupProvider.value === "google"
-                ? "Create your own Google Desktop OAuth client, import its downloaded JSON, then authorize calendar access."
-                : (setupProvider.value === "icloud"
-                  ? "iCloud requires your Apple ID and an app-specific password, not your Apple ID password."
-                  : "Enter the CalDAV server URL, username, and app password or account secret.")
-              wrapMode: Text.Wrap
-              textFormat: Text.PlainText
-              color: Qt.darker(root.contentForeground, 1.35)
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.bodySmall
+            Row {
+              spacing: Style.space(6)
+              Button { text: root.addFormOpen ? "Hide add form" : "Add subscription"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; enabled: !root.subscriptionBusy && root.subscriptions.length < 16; onClicked: { root.addFormOpen = !root.addFormOpen; if (!root.addFormOpen) root.clearCredentialFields() } }
+              Button { text: "Refresh all"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; bordered: true; enabled: !root.subscriptionBusy && root.subscriptions.length > 0; onClicked: root.refreshSubscriptions() }
+              Button { text: "Close"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; onClicked: { root.settingsOpen = false; root.clearCredentialFields() } }
             }
             Column {
-              visible: setupProvider.value === "google"
-              width: parent.width
-              spacing: Style.space(6)
-
-              Text {
-                width: parent.width
-                text: "1. Open Google Cloud, select a project, enable Google Calendar API, and configure OAuth consent.\n2. Create an OAuth client with application type Desktop app, then download its JSON.\n3. Import that JSON here and click Connect. External testing apps must include your account as a test user."
-                wrapMode: Text.Wrap
-                textFormat: Text.PlainText
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
-              Button {
-                width: parent.width
-                text: "Open Google Cloud setup"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                bordered: true
-                focusable: true
-                enabled: !root.setupBusy
-                onClicked: Qt.openUrlExternally(root.googleCloudSetupUrl)
-              }
-              Button {
-                width: parent.width
-                text: "Import Desktop OAuth JSON"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                bordered: true
-                focusable: true
-                enabled: !root.setupBusy
-                onClicked: root.openGoogleClientFilePicker()
-              }
-              Text {
-                visible: root.setupClientFilePath !== ""
-                width: parent.width
-                text: "Desktop OAuth JSON selected. The backend reads it only during secure setup."
-                wrapMode: Text.Wrap
-                textFormat: Text.PlainText
-                color: Color.accent
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
-            }
-            TextField {
-              id: setupDisplayName
-              width: parent.width
-              placeholderText: "Display name (optional)"
-              foreground: root.contentForeground
-              font.family: root.contentFontFamily
-              enabled: !root.setupBusy
-              onTextChanged: root.resetSetupFeedback()
-            }
-            Text {
-              visible: setupProvider.value === "google"
-              width: parent.width
-              text: "Advanced fallback: enter the Desktop client ID and secret manually."
-              wrapMode: Text.Wrap
-              textFormat: Text.PlainText
-              color: Qt.darker(root.contentForeground, 1.35)
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.caption
-            }
-            TextField {
-              id: setupClientId
-              visible: setupProvider.value === "google"
-              width: parent.width
-              placeholderText: "Google Desktop OAuth client ID"
-              foreground: root.contentForeground
-              font.family: root.contentFontFamily
-              enabled: !root.setupBusy
-              inputMethodHints: Qt.ImhNoPredictiveText
-              onTextChanged: {
-                if (text !== "") root.setupClientFilePath = ""
-                root.resetSetupFeedback()
-              }
-            }
-            TextField {
-              id: setupUsername
-              visible: setupProvider.value !== "google"
-              width: parent.width
-              placeholderText: setupProvider.value === "icloud" ? "Apple ID" : "CalDAV username"
-              foreground: root.contentForeground
-              font.family: root.contentFontFamily
-              enabled: !root.setupBusy
-              inputMethodHints: Qt.ImhNoPredictiveText
-              onTextChanged: root.resetSetupFeedback()
-            }
-            TextField {
-              id: setupUrl
-              visible: setupProvider.value === "caldav"
-              width: parent.width
-              placeholderText: "CalDAV URL (https://…)"
-              foreground: root.contentForeground
-              font.family: root.contentFontFamily
-              enabled: !root.setupBusy
-              inputMethodHints: Qt.ImhUrlCharactersOnly | Qt.ImhNoPredictiveText
-              onTextChanged: root.resetSetupFeedback()
-            }
-            TextField {
-              id: setupSecret
-              width: parent.width
-              placeholderText: setupProvider.value === "google" ? "OAuth client secret" : "App password / secret"
-              foreground: root.contentForeground
-              font.family: root.contentFontFamily
-              enabled: !root.setupBusy
-              echoMode: TextInput.Password
-              inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText
-              onTextChanged: {
-                if (setupProvider.value === "google" && text !== "") root.setupClientFilePath = ""
-                root.resetSetupFeedback()
-              }
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                  root.submitAccountSetup()
-                  event.accepted = true
-                }
-              }
-            }
-            Text {
-              visible: root.setupMessage !== ""
-              width: parent.width
-              text: root.setupMessage
-              wrapMode: Text.Wrap
-              textFormat: Text.PlainText
-              color: root.setupState === "success" ? Color.accent : root.contentForeground
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-            Text {
-              visible: root.setupBrowserUrl !== ""
-              width: parent.width
-              text: root.setupBrowserUrl
-              wrapMode: Text.WrapAnywhere
-              textFormat: Text.PlainText
-              color: Color.accent
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.caption
-            }
-            Text {
-              visible: root.setupWarning !== ""
-              width: parent.width
-              text: root.setupWarning
-              wrapMode: Text.Wrap
-              textFormat: Text.PlainText
-              color: Color.urgent
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-            Text {
-              visible: root.setupError !== ""
-              width: parent.width
-              text: root.setupError
-              wrapMode: Text.Wrap
-              textFormat: Text.PlainText
-              color: Color.urgent
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-            Row {
-              anchors.right: parent.right
-              spacing: Style.space(6)
-              Button {
-                text: root.setupBusy
-                  ? (root.setupStage === "committing" ? "Activating…" : "Cancel setup")
-                  : "Close"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                focusable: true
-                enabled: !root.setupBusy || root.setupStage !== "committing"
-                onClicked: {
-                  if (root.setupBusy) root.cancelAccountSetup()
-                  else root.closeSetupForm()
-                }
-              }
-              Button {
-                visible: !root.setupBusy && root.setupState !== "success"
-                text: root.setupState === "error" || root.setupState === "cancelled" ? "Try again" : "Connect"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                bordered: true
-                focusable: true
-                enabled: !root.requestBusy
-                onClicked: root.submitAccountSetup()
-              }
+              visible: root.addFormOpen; width: parent.width; spacing: Style.space(6)
+              TextField { id: feedName; width: parent.width; placeholderText: "Display name"; foreground: root.contentForeground; font.family: root.contentFontFamily; enabled: !root.subscriptionBusy }
+              TextField { id: feedUrl; width: parent.width; placeholderText: "Private HTTPS ICS URL"; foreground: root.contentForeground; font.family: root.contentFontFamily; echoMode: TextInput.Password; inputMethodHints: Qt.ImhSensitiveData | Qt.ImhUrlCharactersOnly | Qt.ImhNoPredictiveText; enabled: !root.subscriptionBusy }
+              TextField { id: feedUsername; width: parent.width; placeholderText: "Username (optional, requires password)"; foreground: root.contentForeground; font.family: root.contentFontFamily; inputMethodHints: Qt.ImhNoPredictiveText; enabled: !root.subscriptionBusy }
+              TextField { id: feedPassword; width: parent.width; placeholderText: "Password (optional, requires username)"; foreground: root.contentForeground; font.family: root.contentFontFamily; echoMode: TextInput.Password; inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText; enabled: !root.subscriptionBusy }
+              TextField { id: feedColor; width: parent.width; placeholderText: "Color (optional #RRGGBB)"; foreground: root.contentForeground; font.family: root.contentFontFamily; enabled: !root.subscriptionBusy }
+              Button { anchors.right: parent.right; text: root.subscriptionBusy ? "Adding…" : "Add"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; bordered: true; enabled: !root.subscriptionBusy; onClicked: root.submitSubscription() }
             }
           }
 
           Column {
-            visible: root.addingEvent
-            width: monthGrid.width
-            anchors.horizontalCenter: parent.horizontalCenter
-            spacing: Style.space(7)
-            Keys.onEscapePressed: root.cancelAdd()
-
-            Text {
-              text: "NEW EVENT"
-              color: root.contentForeground
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-              font.letterSpacing: 1
-            }
-            Dropdown {
-              id: eventCalendar
-              width: parent.width
-              label: "Calendar"
-              value: ""
-              options: root.calendarOptions
-              foreground: root.contentForeground
-              fontFamily: root.contentFontFamily
-              onChanged: function(value) { root.formError = "" }
-            }
-            TextField {
-              id: eventTitle
-              width: parent.width
-              placeholderText: "Title"
-              foreground: root.contentForeground
-              font.family: root.contentFontFamily
-              enabled: !root.createLoading
-              Keys.onPressed: function(event) {
-                if (event.key === Qt.Key_Escape) { root.cancelAdd(); event.accepted = true }
-                else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.submitAdd(); event.accepted = true }
-              }
-            }
-            Row {
-              width: parent.width
-              spacing: Style.space(6)
-              TextField {
-                id: eventDate
-                width: parent.width - eventStart.width - eventEnd.width - parent.spacing * 2
-                placeholderText: "YYYY-MM-DD"
-                foreground: root.contentForeground
-                font.family: root.contentFontFamily
-                enabled: !root.createLoading
-                Keys.onEscapePressed: root.cancelAdd()
-              }
-              TextField {
-                id: eventStart
-                width: Style.space(82)
-                placeholderText: "09:00"
-                foreground: root.contentForeground
-                font.family: root.contentFontFamily
-                enabled: !root.createLoading
-                inputMethodHints: Qt.ImhDigitsOnly
-                Keys.onEscapePressed: root.cancelAdd()
-              }
-              TextField {
-                id: eventEnd
-                width: Style.space(82)
-                placeholderText: "10:00"
-                foreground: root.contentForeground
-                font.family: root.contentFontFamily
-                enabled: !root.createLoading
-                inputMethodHints: Qt.ImhDigitsOnly
-                Keys.onEscapePressed: root.cancelAdd()
-              }
-            }
-            Text {
-              visible: root.formError !== ""
-              width: parent.width
-              text: root.formError
-              wrapMode: Text.Wrap
-              color: Color.urgent
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.bodySmall
-            }
-            Row {
-              anchors.right: parent.right
-              spacing: Style.space(6)
-              Button {
-                text: "Cancel"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                focusable: true
-                onClicked: root.cancelAdd()
-              }
-              Button {
-                text: root.createLoading ? "Creating…" : "Create"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                bordered: true
-                focusable: true
-                enabled: !root.createLoading
-                onClicked: root.submitAdd()
-              }
-            }
+            visible: root.subscriptionBusy || root.subscriptionMessage !== "" || root.subscriptionError !== ""
+            width: root.settingsOpen ? Style.space(410) : monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; spacing: Style.space(4)
+            Text { width: parent.width; visible: root.subscriptionMessage !== ""; text: root.subscriptionMessage; wrapMode: Text.Wrap; color: root.subscriptionState === "success" ? Color.accent : root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
+            Text { width: parent.width; visible: root.subscriptionError !== ""; text: root.subscriptionError; wrapMode: Text.Wrap; color: Color.urgent; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
+            Button { visible: root.subscriptionBusy; text: "Cancel operation"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; onClicked: root.cancelSubscription() }
           }
-
-          Text {
-            visible: !root.addingEvent && (root.calendarError !== "" || root.backendStatus !== "")
-            width: monthGrid.width
-            anchors.horizontalCenter: parent.horizontalCenter
-            text: root.calendarError || root.backendStatus
-            wrapMode: Text.Wrap
-            color: Qt.darker(root.contentForeground, 1.5)
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.caption
-          }
+          Text { visible: !root.settingsOpen && root.backendStatus !== ""; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: root.backendStatus; wrapMode: Text.Wrap; color: Color.urgent; font.family: root.contentFontFamily; font.pixelSize: Style.font.caption }
         }
       }
     }

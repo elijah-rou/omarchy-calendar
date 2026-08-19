@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "elijahrou.calendar",
   "name": "Omarchy Calendar",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "author": "Elijah Roussos",
-  "description": "Calendar, agenda, and event creation for the Omarchy bar",
+  "description": "Read-only ICS calendar and agenda for the Omarchy bar",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Omarchy Calendar",
-    "description": "Clock with month markers, upcoming agenda, and event creation",
+    "description": "Clock with a read-only ICS month view and upcoming agenda",
     "category": "Time",
     "allowMultiple": false,
     "defaultSection": "center",

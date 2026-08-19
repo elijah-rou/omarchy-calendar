@@ -407,20 +407,8 @@ function upcomingEvents(values, fromKey, limit) {
   return selected
 }
 
-function militaryTime(value) {
-  var match = /^(\d{2}):(\d{2})$/.exec(String(value || ""))
-  if (!match) return null
-  var hour = Number(match[1])
-  var minute = Number(match[2])
-  return hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 ? hour * 60 + minute : null
-}
-
 function invalidInput(field, error) {
   return { valid: false, field: field, error: error, value: null }
-}
-
-function invalidCreate(field, error) {
-  return invalidInput(field, error)
 }
 
 function utf8Length(value) {
@@ -437,22 +425,6 @@ function utf8Length(value) {
     } else bytes += 3
   }
   return bytes
-}
-
-function durableSetupFields(input) {
-  var source = input && typeof input === "object" ? input : {}
-  var provider = trimmed(source.provider, 16).toLowerCase()
-  var value = { provider: provider }
-  var displayName = trimmed(source.displayName, 256)
-  if (displayName !== "") value.displayName = displayName
-  if (provider === "google") {
-    var clientId = trimmed(source.clientId, 512)
-    if (clientId !== "") value.clientId = clientId
-  } else if (provider === "caldav" || provider === "icloud") {
-    value.username = trimmed(source.username, 512)
-    if (provider === "caldav") value.url = trimmed(source.url, 4096)
-  }
-  return value
 }
 
 function validHttpsAuthority(value) {
@@ -480,149 +452,102 @@ function validHttpsAuthority(value) {
   return authority.charAt(authority.length - 1) !== ":"
 }
 
-function isHttpsCaldavUrl(value) {
+function isPrivateHttpsIcsUrl(value) {
   var text = String(value || "")
   return text === text.replace(/^\s+|\s+$/g, "") && text.indexOf("#") === -1
-    && !/[\x00-\x20]/.test(text) && validHttpsAuthority(text)
+    && !/[\x00-\x20]/.test(text) && utf8Length(text) <= 8192 && validHttpsAuthority(text)
 }
 
-function isGoogleAuthorizationUrl(value) {
-  var text = String(value || "")
-  var match = /^https:\/\/accounts\.google\.com(?::(\d+))?\/o\/oauth2\/(?:v2\/)?auth\?[^\s#]+$/.exec(text)
-  return !!match && (match[1] === undefined || match[1] === "443")
-    && text.length <= 8192 && !/%(?![0-9A-Fa-f]{2})/.test(text)
-}
-
-function parseSetupProtocolLine(line, requestId, state) {
-  var current = state && typeof state === "object" ? state : {}
-  var response = null
-  try { response = JSON.parse(String(line || "")) }
-  catch (error) { return { valid: false, error: "Calendar setup returned invalid progress data" } }
-  if (!response || typeof response !== "object" || Array.isArray(response)
-      || String(response.requestId || "") !== String(requestId || ""))
-    return { valid: false, error: "Calendar setup response did not match its request" }
-  if (current.finalSeen === true)
-    return { valid: false, error: "Calendar setup returned an invalid message sequence" }
-  if (response.type === "progress" && typeof response.stage === "string" && typeof response.message === "string")
-    return { valid: true, kind: "progress", response: response, state: current }
-  if (response.type === "browser" && current.browserSeen !== true && isGoogleAuthorizationUrl(response.url))
-    return { valid: true, kind: "browser", response: response, state: { browserSeen: true, finalSeen: false } }
-  if (response.type === "result" && response.final === true && typeof response.ok === "boolean")
-    return {
-      valid: true,
-      kind: "result",
-      response: response,
-      state: { browserSeen: current.browserSeen === true, finalSeen: true }
-    }
-  return { valid: false, error: "Calendar setup returned an invalid message sequence" }
-}
-
-function setupResultPresentation(finalResponse, locallyCancelled) {
-  if (finalResponse && finalResponse.ok === true) {
-    return {
-      state: "success",
-      message: finalResponse.replacesExisting === true
-        ? "Calendar account replaced successfully" : "Calendar account connected successfully",
-      warning: finalResponse.cleanupComplete === false
-        ? "Account connected, but an old credential or token could not be removed." : ""
-    }
-  }
-  if (locallyCancelled === true)
-    return { state: "cancelled", message: "Account setup cancelled", warning: "" }
-  return null
-}
-
-function validateSetupInput(input) {
+function durableSubscriptionMetadata(input) {
   var source = input && typeof input === "object" ? input : {}
-  var value = durableSetupFields(source)
-  if (["google", "caldav", "icloud"].indexOf(value.provider) === -1)
-    return invalidInput("provider", "Choose Google, iCloud, or CalDAV")
-  var rawDisplayName = String(source.displayName === undefined || source.displayName === null ? "" : source.displayName)
-  if (utf8Length(rawDisplayName.replace(/^\s+|\s+$/g, "")) > 256 || /[\x00\r\n]/.test(rawDisplayName))
-    return invalidInput("displayName", "Display name is too long or contains a line break")
+  var value = {}
+  var id = trimmed(source.id, 32)
+  var name = trimmed(source.name, 256)
+  var color = trimmed(source.color, 7)
+  if (id !== "") value.id = id
+  if (name !== "") value.name = name
+  if (/^#[0-9A-Fa-f]{6}$/.test(color)) value.color = color.toLowerCase()
+  return value
+}
 
-  if (value.provider === "google") {
-    var rawClientFile = String(source.clientFile === undefined || source.clientFile === null ? "" : source.clientFile)
-    var rawClientId = String(source.clientId === undefined || source.clientId === null ? "" : source.clientId)
-    var rawGoogleSecret = String(source.secret === undefined || source.secret === null ? "" : source.secret)
-    if (rawClientFile !== "") {
-      if (rawClientId !== "" || rawGoogleSecret !== "")
-        return invalidInput("clientFile", "Use either imported JSON or manual OAuth credentials")
-      if (rawClientFile.charAt(0) !== "/" || utf8Length(rawClientFile) > 4096
-          || /[\x00-\x1f\x7f]/.test(rawClientFile))
-        return invalidInput("clientFile", "Choose one local Google Desktop OAuth JSON file")
-      value.clientFile = rawClientFile
-      return { valid: true, field: "", error: "", value: value }
-    }
-    if (!value.clientId) return invalidInput("clientId", "Import the Desktop OAuth JSON or enter its client ID")
-    if (utf8Length(rawClientId.replace(/^\s+|\s+$/g, "")) > 512 || /[\x00\r\n]/.test(rawClientId))
-      return invalidInput("clientId", "OAuth client ID is too long or contains a line break")
-  } else {
-    var rawUsername = String(source.username === undefined || source.username === null ? "" : source.username)
-    if (value.username === "")
-      return invalidInput("username", value.provider === "icloud" ? "Enter your Apple ID" : "Enter the CalDAV username")
-    if (utf8Length(rawUsername.replace(/^\s+|\s+$/g, "")) > 512 || /[\x00\r\n]/.test(rawUsername))
-      return invalidInput("username", "Username is too long or contains a line break")
-    if (value.provider === "caldav") {
-      var rawUrl = String(source.url === undefined || source.url === null ? "" : source.url)
-      if (!isHttpsCaldavUrl(value.url))
-        return invalidInput("url", "Use an HTTPS CalDAV URL without credentials or a fragment")
-      if (utf8Length(rawUrl.replace(/^\s+|\s+$/g, "")) > 4096 || /[\x00\r\n]/.test(rawUrl))
-        return invalidInput("url", "CalDAV URL is too long or contains a line break")
-    }
-  }
-
-  var secret = String(source.secret === undefined || source.secret === null ? "" : source.secret)
-  if (secret.replace(/^\s+|\s+$/g, "") === "")
-    return invalidInput("secret", value.provider === "google" ? "Enter the OAuth client secret" : "Enter the app password")
-  if (utf8Length(secret) > 16384 || /[\x00\r\n]/.test(secret))
-    return invalidInput("secret", "Secret is too long or contains a line break")
-  value.secret = secret
+function validateSubscriptionInput(input) {
+  var source = input && typeof input === "object" ? input : {}
+  var rawName = String(source.name === undefined || source.name === null ? "" : source.name)
+  var name = rawName.replace(/^\s+|\s+$/g, "")
+  if (name === "" || utf8Length(name) > 256 || /[\x00\r\n]/.test(rawName))
+    return invalidInput("name", "Enter a display name of at most 256 bytes")
+  var url = String(source.url === undefined || source.url === null ? "" : source.url)
+  if (!isPrivateHttpsIcsUrl(url))
+    return invalidInput("url", "Use a private HTTPS ICS URL without credentials or a fragment")
+  var username = String(source.username === undefined || source.username === null ? "" : source.username).replace(/^\s+|\s+$/g, "")
+  var password = String(source.password === undefined || source.password === null ? "" : source.password)
+  if ((username === "") !== (password === ""))
+    return invalidInput(username === "" ? "username" : "password", "Username and password must be supplied together")
+  if (utf8Length(username) > 1024 || /[\x00-\x1f\x7f:]/.test(username))
+    return invalidInput("username", "Username is invalid")
+  if (utf8Length(password) > 16384)
+    return invalidInput("password", "Password is too long")
+  var color = String(source.color === undefined || source.color === null ? "" : source.color).replace(/^\s+|\s+$/g, "")
+  if (color !== "" && !/^#[0-9A-Fa-f]{6}$/.test(color))
+    return invalidInput("color", "Color must use #RRGGBB")
+  var value = { action: "add", name: name, url: url }
+  if (color !== "") value.color = color.toLowerCase()
+  if (username !== "") { value.username = username; value.password = password }
   return { valid: true, field: "", error: "", value: value }
 }
 
-function validateCreateInput(input) {
-  var value = input && typeof input === "object" ? input : {}
-  var calendarId = trimmed(value.calendarId, 200)
-  var title = trimmed(value.title, 200)
-  var date = trimmed(value.date, 10)
-  var start = trimmed(value.start, 5)
-  var end = trimmed(value.end, 5)
-  if (calendarId === "") return invalidCreate("calendarId", "Choose a calendar")
-  if (title === "") return invalidCreate("title", "Enter a title")
-  if (!validDateKey(date)) return invalidCreate("date", "Use a valid date (YYYY-MM-DD)")
-  var startMinute = militaryTime(start)
-  if (startMinute === null) return invalidCreate("start", "Use 24-hour start time (HH:MM)")
-  var endMinute = militaryTime(end)
-  if (endMinute === null) return invalidCreate("end", "Use 24-hour end time (HH:MM)")
-  if (endMinute <= startMinute) return invalidCreate("end", "End must be after start")
-  return {
-    valid: true,
-    field: "",
-    error: "",
-    value: {
-      calendarId: calendarId,
-      title: title,
-      start: date + "T" + start,
-      end: date + "T" + end,
-      allDay: false,
-      sync: false
-    }
-  }
+// Accept progress records only before one final result. This keeps the QML
+// process parser deterministic even if a helper emits malformed extra lines.
+function parseSubscriptionProtocolLine(line, requestId, state) {
+  var current = state && typeof state === "object" ? state : { finalSeen: false, progressCount: 0 }
+  var response
+  try { response = JSON.parse(String(line || "")) }
+  catch (error) { return { valid: false, error: "Subscription helper returned invalid JSON" } }
+  if (!response || typeof response !== "object" || Array.isArray(response)
+      || String(response.requestId || "") !== String(requestId || "") || current.finalSeen === true)
+    return { valid: false, error: "Subscription helper returned an invalid message sequence" }
+  if (response.type === "progress" && response.final === false && typeof response.stage === "string")
+    return { valid: true, kind: "progress", response: response,
+      state: { finalSeen: false, progressCount: Number(current.progressCount || 0) + 1 } }
+  if (response.type === "result" && response.final === true && typeof response.ok === "boolean")
+    return { valid: true, kind: "result", response: response,
+      state: { finalSeen: true, progressCount: Number(current.progressCount || 0) } }
+  return { valid: false, error: "Subscription helper returned an invalid message sequence" }
 }
 
 function localPathForUrl(value) {
   var text = String(value || "")
   if (text.indexOf("file:///") === 0) {
     if (/[?#]/.test(text)) return ""
-    try {
-      text = decodeURIComponent(text.substring(7))
-    } catch (error) {
-      return ""
-    }
+    try { text = decodeURIComponent(text.substring(7)) }
+    catch (error) { return "" }
   }
-  if (text.charAt(0) !== "/" || /[\0\r\n]/.test(text)) return ""
+  if (text.charAt(0) !== "/" || /[\x00\r\n]/.test(text)) return ""
   return text
+}
+
+function normalizeSubscriptionStatus(metadata, lastRefresh) {
+  var values = Array.isArray(metadata) ? metadata : []
+  var results = lastRefresh && Array.isArray(lastRefresh.subscriptions) ? lastRefresh.subscriptions : []
+  var byId = {}
+  for (var i = 0; i < results.length && i < 16; i++) {
+    var result = results[i]
+    if (!result || typeof result !== "object") continue
+    var resultId = trimmed(result.id, 32)
+    if (resultId === "") continue
+    byId[resultId] = result.ok === true ? { status: "ok", detail: String(Number(result.events) || 0) + " events" }
+      : { status: "error", detail: trimmed(result.error && result.error.message, 300) || "Refresh failed" }
+  }
+  var normalized = []
+  for (var j = 0; j < values.length && normalized.length < 16; j++) {
+    var item = durableSubscriptionMetadata(values[j])
+    if (!item.id || !item.name) continue
+    var refresh = byId[item.id] || { status: "unknown", detail: "Not refreshed yet" }
+    item.status = refresh.status
+    item.statusText = refresh.detail
+    normalized.push(item)
+  }
+  return normalized
 }
 
 if (typeof module !== "undefined") {
@@ -652,14 +577,11 @@ if (typeof module !== "undefined") {
     eventDateKeys: eventDateKeys,
     mapEventsByDate: mapEventsByDate,
     upcomingEvents: upcomingEvents,
-    militaryTime: militaryTime,
-    durableSetupFields: durableSetupFields,
-    isHttpsCaldavUrl: isHttpsCaldavUrl,
-    isGoogleAuthorizationUrl: isGoogleAuthorizationUrl,
-    parseSetupProtocolLine: parseSetupProtocolLine,
-    setupResultPresentation: setupResultPresentation,
-    validateSetupInput: validateSetupInput,
-    validateCreateInput: validateCreateInput,
+    validateSubscriptionInput: validateSubscriptionInput,
+    durableSubscriptionMetadata: durableSubscriptionMetadata,
+    isPrivateHttpsIcsUrl: isPrivateHttpsIcsUrl,
+    parseSubscriptionProtocolLine: parseSubscriptionProtocolLine,
+    normalizeSubscriptionStatus: normalizeSubscriptionStatus,
     localPathForUrl: localPathForUrl,
     clockFormats: clockFormats,
     clockFormatRing: clockFormatRing,

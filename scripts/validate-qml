@@ -11,15 +11,17 @@ node --check tests/model.test.js
 qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml Panel.qml
 qmllint Model.js
 
-if rg -q 'QtQuick\.Dialogs|\bFileDialog\s*\{' Panel.qml; then
-  printf 'Panel.qml must use an external file picker; native Qt dialogs can crash Quickshell\n' >&2
+# The v1 UI is subscription-only. Provider account setup, writable event UI,
+# and native file dialogs must not creep back into the shipped QML/model.
+if rg -qi 'oauth|icloud|caldav|FileDialog|QtQuick\.Dialogs|zenity|validateCreateInput|validateSetupInput|setup-request|action:[[:space:]]*"create"' Panel.qml Model.js BarWidget.qml tests/model.test.js; then
+  printf 'legacy provider, writable-event, or native-dialog UI found\n' >&2
   exit 1
 fi
-rg -q '"/usr/bin/zenity"' Panel.qml
+rg -q 'Settings → Integrate calendar → Secret address in iCal format' Panel.qml
+rg -q 'command = \["thunderbird", "-calendar"\]' Panel.qml
+rg -q 'tooltipText: "Open Thunderbird Calendar"' Panel.qml
 
 # Qt's standalone parser does not understand Quickshell's typed IPC methods.
-# Strip only the `: void` return annotation in a same-directory lint copy so
-# relative imports still resolve and the rest of the shipped entry point parses.
 lint_entry="$root/.BarWidget.lint.qml"
 trap 'rm -f "$lint_entry"' EXIT
 sed -E 's/(function [A-Za-z0-9_]+\(\)): void/\1/' BarWidget.qml >"$lint_entry"
