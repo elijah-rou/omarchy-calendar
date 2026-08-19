@@ -508,6 +508,7 @@ class BackendTests(Isolated):
         self.assertIn('write(root.pendingSubscriptionPayload + "\\n")', panel)
         self.assertIn('root.pendingSubscriptionPayload = ""', panel)
         self.assertIn('feedUrl.text = ""; feedUsername.text = ""; feedPassword.text = ""', panel)
+        self.assertIn('subscriptionCredentialCritical = request.action === "add"', panel)
         self.assertIn('parsed.response.stage === "committing"', panel)
         self.assertIn('subscriptionBusy && !root.subscriptionCommitStarted', panel)
         self.assertIn('subscriptionCancelled = false\n        subscriptionState = "success"', panel)

@@ -216,7 +216,11 @@ Panel {
     subscriptionState = "running"; subscriptionMessage = message; subscriptionError = ""
     subscriptionProtocolState = { finalSeen: false, progressCount: 0 }
     subscriptionResponseCharacters = 0; subscriptionResponseLines = 0
-    subscriptionTimedOut = false; subscriptionCancelled = false; subscriptionCommitStarted = false; subscriptionCredentialCritical = false
+    subscriptionTimedOut = false; subscriptionCancelled = false; subscriptionCommitStarted = false
+    // Add starts by crossing the Secret Service boundary. Hide cancellation
+    // before Process.onStarted so no hard-kill timer can race its first
+    // `securing` progress message.
+    subscriptionCredentialCritical = request.action === "add"
     subscriptionProcess.command = [helperPath, "subscriptions"]
     subscriptionProcess.running = true
   }
