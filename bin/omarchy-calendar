@@ -1,31 +1,57 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env python3
+"""Single command wrapper for Omarchy Calendar backend operations."""
 
-script_path=$(readlink -f -- "$0")
-script_dir=$(unset CDPATH; cd -- "$(dirname -- "$script_path")" && pwd)
-command_name=${1:-}
-if [ "$#" -gt 0 ]; then
-    shift
-fi
+from __future__ import annotations
 
-case "$command_name" in
-    request)
-        exec "$script_dir/omarchy-calendar-backend" "$@"
-        ;;
-    setup)
-        exec "$script_dir/omarchy-calendar-setup" "$@"
-        ;;
-    setup-request)
-        exec "$script_dir/omarchy-calendar-setup-request" "$@"
-        ;;
-    sync)
-        exec "$script_dir/omarchy-calendar-sync" "$@"
-        ;;
-    ""|-h|--help)
-        printf '%s\n' 'Usage: omarchy-calendar <request|setup|setup-request|sync> [arguments...]'
-        ;;
-    *)
-        printf 'omarchy-calendar: unknown command: %s\n' "$command_name" >&2
-        exit 2
-        ;;
-esac
+import json
+import signal
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root))
+
+from backend import calendar_backend
+from backend.subscriptions import (
+    SubscriptionError,
+    handle_termination,
+    refresh_subscriptions,
+    subscriptions_main,
+)
+
+
+def usage() -> None:
+    print("Usage: omarchy-calendar <request|subscriptions|sync>")
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        usage()
+        return 0 if len(sys.argv) == 1 else 2
+    command = sys.argv[1]
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGINT, handle_termination)
+    if command == "request":
+        return calendar_backend.main()
+    if command == "subscriptions":
+        return subscriptions_main()
+    if command == "sync":
+        try:
+            result = refresh_subscriptions()
+        except SubscriptionError as error:
+            print(error.message, file=sys.stderr)
+            return 1
+        if not result["ok"]:
+            failed = sum(not item["ok"] for item in result["subscriptions"])
+            print(f"{failed} subscription refresh(es) failed", file=sys.stderr)
+            return 1
+        print(json.dumps(result, separators=(",", ":")))
+        return 0
+    if command in {"-h", "--help"}:
+        usage()
+        return 0
+    print(f"omarchy-calendar: unknown command: {command}", file=sys.stderr)
+    return 2
+
+
+raise SystemExit(main())

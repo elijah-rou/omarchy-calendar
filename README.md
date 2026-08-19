@@ -1,232 +1,98 @@
 # Omarchy Calendar
 
-An Itsycal-style calendar and agenda for the Omarchy bar. Calendar data stays in
-private XDG directories and the shell talks to a small JSON backend rather than
-to network services or credential stores.
+An Itsycal-style, read-only calendar and agenda for the Omarchy bar. Calendar
+subscriptions and generated data stay in private XDG directories. The shell
+uses bounded JSON protocols rather than contacting feeds or credential stores.
 
 ## Requirements
 
-- Python 3.11 or newer, standard library only
-- `khal` 0.14.0
-- `vdirsyncer` 0.20.0 for synchronized calendars
-- A secret lookup command such as `secret-tool`, `pass`, or a private script
-
-The backend and generated configuration are verified against the exact CLI and
-configuration behavior of khal 0.14.0 and vdirsyncer 0.20.0.
-
-## Install
+- Python 3.11 or newer
+- `python-icalendar`
+- `khal` 0.14.0 or newer
+- Secret Service and `secret-tool` from libsecret
 
 ```sh
-omarchy pkg add khal vdirsyncer python-aiohttp-oauthlib libsecret zenity
+omarchy pkg add khal python-icalendar libsecret
 omarchy plugin add https://github.com/elijah-rou/omarchy-calendar.git --enable
 omarchy plugin disable omarchy.clock
 ```
 
-During local development, link the repository to
-`~/.config/omarchy/plugins/elijahrou.calendar` instead of cloning it.
+## ICS subscriptions
 
-## Setup
+Calendar settings use `omarchy-calendar subscriptions`, a newline-delimited JSON
+protocol on standard input and output. It supports at most 16 feeds. Every feed
+has an opaque random ID, a display name, an optional color, a private HTTPS ICS
+URL, and an optional HTTP Basic username/password pair.
 
-All generated files use the `omarchy-calendar` namespace:
+The entire feed URL is treated as a credential because secret Google Calendar
+feed URLs grant bearer access. URL, username, and password are stored together
+in Secret Service. They never appear in arguments, environment variables,
+configuration, status, logs, or errors. The private mode-`0600`
+`subscriptions.json` contains only IDs, names, and colors. Secret Service items
+use deterministic attributes namespaced to the installation's XDG roots.
 
-- configuration: `$XDG_CONFIG_HOME/omarchy-calendar`, default `~/.config/omarchy-calendar`
-- calendar data: `$XDG_DATA_HOME/omarchy-calendar`, default `~/.local/share/omarchy-calendar`
-- sync and OAuth state: `$XDG_STATE_HOME/omarchy-calendar`, default `~/.local/state/omarchy-calendar`
-- khal cache: the normal `$XDG_CACHE_HOME/khal` location
-
-Directories are mode `0700`; generated configuration and status files are mode
-`0600`. Setup refuses to place generated files inside the plugin source tree.
-
-Initialize a local, writable calendar:
-
-```sh
-./bin/omarchy-calendar setup local
-```
-
-Generic CalDAV uses an argv-based secret lookup. Each
-`--password-arg` adds one argument without invoking a shell:
-
-```sh
-./bin/omarchy-calendar setup caldav \
-  --url https://calendar.example.com/dav/ \
-  --username me@example.com \
-  --password-command secret-tool \
-  --password-arg lookup \
-  --password-arg service \
-  --password-arg omarchy-calendar \
-  --password-arg account \
-  --password-arg me@example.com
-```
-
-For iCloud, create an app-specific password and keep it in the selected secret
-store. The setup command supplies the CalDAV URL:
-
-```sh
-./bin/omarchy-calendar setup icloud \
-  --username me@icloud.com \
-  --password-command pass \
-  --password-arg show \
-  --password-arg calendars/icloud
-```
-
-### Guided Google OAuth setup
-
-Google synchronization uses vdirsyncer's browser-based OAuth flow with a
-Desktop OAuth client that you own:
-
-1. Open [Google Auth Platform clients](https://console.cloud.google.com/auth/clients)
-   and create or select a Google Cloud project.
-2. In **APIs & Services → Library**, enable **Google Calendar API** for that
-   project.
-3. In **Google Auth Platform**, complete **Branding** and **Audience**. For a
-   personal app, choose **External**. If its publishing status is **Testing**,
-   add the Google account you will connect under **Audience → Test users**.
-4. Return to **Clients**, choose **Create client**, set **Application type** to
-   **Desktop app**, create it, and choose **Download JSON**.
-5. Open Calendar settings, keep **Google** selected, choose **Import Desktop
-   OAuth JSON**, select the downloaded file, and click **Connect**. Finish the
-   authorization in the browser that opens.
-
-Only Google's standard downloaded `installed` JSON shape is accepted; Web
-application credentials are not. The plugin reads the selected file only for
-that setup attempt and does not modify or delete it. Personal External apps
-left in Testing must include the connected account as a test user and may
-require periodic reconnects because Google can expire testing refresh tokens.
-
-Manual client ID and secret entry remains available in the widget as an
-advanced fallback. The command-line flow can instead fetch the secret from a
-private lookup command:
-
-```sh
-./bin/omarchy-calendar setup google \
-  --client-id CLIENT_ID.apps.googleusercontent.com \
-  --client-secret-command pass \
-  --client-secret-arg show \
-  --client-secret-arg calendars/google-client-secret
-```
-
-Remote setup writes configuration, runs `vdirsyncer discover`, then performs an
-initial sync. Add `--configure-only` to any remote setup command to generate and
-inspect configuration without network access. The plugin currently supports one
-remote profile. A subsequent remote setup replaces that profile and its synced
-data, but never removes the separate local calendar. Google OAuth tokens are
-isolated by account and credential generation in the private XDG state directory.
-The previous Google token and widget-owned secret are invalidated only after the
-replacement has completed successfully.
-
-Install the checked-in systemd user units and enable a sync every 15 minutes:
-
-```sh
-./bin/omarchy-calendar setup install-timer
-```
-
-This copies the sync command to `~/.local/bin`, copies the service and timer to
-the user systemd directory, reloads the user manager, and enables the timer.
-
-### Widget-driven remote setup
-
-`bin/omarchy-calendar setup-request` accepts exactly one newline-terminated JSON
-object on standard input. This endpoint is intended for the widget: the
-plaintext `secret` is accepted only in that request and is sent immediately to
-`secret-tool store` over its standard input. It never appears in command
-arguments, the environment, generated configuration, logs, or protocol output.
-The generated vdirsyncer configuration looks the value up with a fixed argv
-array and no shell.
-
-Requests are limited to 64 KiB and require a `requestId` and `provider`.
-CalDAV and iCloud require `secret`; Google accepts either manual `clientId` plus
-`secret`, or one bounded absolute `clientFile` path naming the downloaded
-Desktop OAuth JSON. Provider-specific examples are:
+Requests are at most 64 KiB and include an optional `requestId`. Output consists
+of bounded progress objects followed by exactly one final result:
 
 ```json
-{"requestId":"setup-1","provider":"caldav","displayName":"Work","username":"me@example.com","url":"https://calendar.example.com/dav/","secret":"app password"}
-{"requestId":"setup-2","provider":"icloud","username":"me@icloud.com","secret":"app-specific password"}
-{"requestId":"setup-3","provider":"google","clientFile":"/home/me/Downloads/client_secret.json"}
-{"requestId":"setup-4","provider":"google","clientId":"CLIENT_ID.apps.googleusercontent.com","secret":"desktop OAuth client secret"}
+{"action":"list","requestId":"list-1"}
+{"action":"add","requestId":"add-1","name":"Personal","color":"#5e81ac","url":"https://calendar.example/private.ics"}
+{"action":"add","requestId":"add-2","name":"Work","url":"https://calendar.example/work.ics","username":"me","password":"app-password"}
+{"action":"remove","requestId":"remove-1","id":"opaque-subscription-id"}
+{"action":"refresh","requestId":"refresh-1"}
 ```
 
-`displayName` is optional for every provider. CalDAV URLs must use HTTPS and
-must not contain embedded credentials. Google `clientFile` input must be an
-absolute path to one regular, nonsymlink, bounded JSON file with the standard
-`installed` shape. The file is never deleted. Its secret is read into the same
-transient secret buffer as manual setup, sent only to `secret-tool store` on
-standard input, and omitted from NDJSON, errors, status, generated config,
-arguments, the environment, and logs. Google setup starts vdirsyncer's browser
-OAuth flow. Every provider performs discovery and an initial sync within the
-five-minute per-command bound.
+Add fetches, parses, and imports a candidate before committing it. Remove updates
+metadata and calendar data before clearing only that subscription's Secret
+Service item. Refresh handles feeds independently and preserves each last-good
+calendar if fetching, validation, or import fails.
 
-Output is bounded NDJSON: zero or more progress objects followed by exactly one
-object with `"type":"result"` and `"final":true`. The final result includes
-`replacesExisting`, which is true when the single existing remote profile was
-replaced. Failed and cancelled attempts remove their candidate credential,
-token, configuration, and data while preserving the active profile.
+Fetching uses Python's standard-library HTTPS client with explicit timeouts and
+redirect, response, event, and imported-data limits. HTTP URLs, userinfo,
+fragments, invalid hosts and ports, and HTTPS downgrade redirects are rejected.
+Basic Authorization is removed on cross-origin redirects. Accepted content must
+parse with `python-icalendar`; `khal import --batch --include-calendar` creates
+the per-UID vdir data used by the widget.
+
+Run the same refresh path manually or from the checked-in systemd user timer:
+
+```sh
+omarchy-calendar sync
+```
 
 ## Backend protocol
 
-Run `bin/omarchy-calendar request` and send exactly one UTF-8 JSON object on
-standard input. It writes exactly one compact JSON object plus a newline to
-standard output. Application errors are JSON responses; subprocess diagnostics
-never share stdout. Requests are limited to 64 KiB, responses to 1 MiB, list
-ranges to 366 days, and list results to 256 events. Commands use argv arrays,
-closed stdin, and explicit 30-second or 5-minute timeouts.
-
-Every request requires `action`. An optional `requestId` string is copied into a
-successful response. Unknown fields and incorrectly typed values are rejected.
-
-### List events
+Run `omarchy-calendar request` and send one UTF-8 JSON object followed by a
+newline. The read-only backend supports `list`, `calendars`, and `status`.
+Create, update, and delete requests return a `read_only` error.
 
 ```json
-{"action":"list","start":"2026-07-01","end":"2026-08-01","calendars":["local"]}
-```
-
-Returns `{"ok":true,"events":[...]}`. Event objects use `calendarId`,
-`calendarName`, ISO local `start`/`end`, and `allDay`. Dates use `YYYY-MM-DD`;
-`start` and `end` are inclusive and may be the same day. Omit `calendars` to
-include all calendars.
-
-### Create an event
-
-```json
-{"action":"create","title":"Review","start":"2026-07-14T10:00","end":"2026-07-14T10:30","calendarId":"local","location":"Desk","description":"Quarterly plan"}
-```
-
-Timed values use local `YYYY-MM-DDTHH:MM`. For all-day events, set `allDay` to
-`true` and use `YYYY-MM-DD` for both values. `calendar`, `location`, and
-`description` are optional. `sync` defaults to `true`; set it to `false` when a
-caller is batching writes.
-
-The panel creates locally with `sync: false`; the user timer performs the next
-remote synchronization without blocking the UI. Other callers may request an
-immediate sync. khal commits the event to the local vdir before vdirsyncer runs.
-A remote sync failure is returned in the successful create response under `sync` and recorded
-in `$XDG_STATE_HOME/omarchy-calendar/sync-status.json`; it does not discard or
-misreport the local creation.
-
-### Calendars and status
-
-```json
+{"action":"list","start":"2026-07-01","end":"2026-08-01","calendars":["subscription-id"]}
 {"action":"calendars"}
 {"action":"status"}
 ```
 
-`calendars` returns khal's configured names. `status` reports whether local and
-remote configuration exist, installed command versions, and the bounded last
-sync result. Its `remoteAccount` object provides `connected`, the known provider
-and display name, and a `setupMode` of `connect` or `replace`, allowing the
-widget to label the one-profile replacement behavior before setup. It does not
-contact a remote service.
+List dates are inclusive, including a same-day range. Requests are limited to
+64 KiB, responses to 1 MiB, ranges to 366 days, and results to 256 events. With
+zero subscriptions, `list` and `calendars` return empty results without invoking
+khal.
 
-Errors have this form:
+`calendars` returns subscription IDs and display metadata with `writable:false`.
+`status` reports `readOnly:true`, the subscription count and nonsecret metadata,
+a sanitized last refresh result, and installed khal and python-icalendar
+versions. It does not access Secret Service or a remote feed.
 
-```json
-{"ok":false,"error":{"code":"invalid_request","message":"..."}}
-```
+Generated paths use the `omarchy-calendar` namespace:
+
+- metadata and khal config: `$XDG_CONFIG_HOME/omarchy-calendar`
+- read-only vdir data: `$XDG_DATA_HOME/omarchy-calendar/calendars`
+- refresh status and lock: `$XDG_STATE_HOME/omarchy-calendar`
+
+Directories are mode `0700`; generated files are mode `0600`.
 
 ## Validation
 
-Tests use temporary HOME and XDG roots plus fake commands for failures and
-ordering. When khal 0.14.0 is installed, an isolated real-CLI compatibility test
-creates and lists an event.
+Tests use isolated XDG roots and fake Secret Service and khal commands.
 
 ```sh
 ./scripts/validate

@@ -1,43 +1,30 @@
 #!/usr/bin/env python3
-"""Bounded JSON interface to khal and vdirsyncer."""
+"""Bounded read-only JSON interface to subscribed ICS calendars."""
 
 from __future__ import annotations
 
 import datetime as dt
-import fcntl
+import importlib.metadata
 import json
-import os
-import selectors
 import shutil
 import signal
-import subprocess
 import sys
-import tempfile
-import time
-from pathlib import Path
 from typing import Any
+
+from backend.subscriptions import (
+    SubscriptionError,
+    load_subscriptions,
+    paths,
+    run_bounded,
+    terminate_process_group,
+)
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
-MAX_STDERR_BYTES = 64 * 1024
 MAX_EVENTS = 256
 MAX_RANGE_DAYS = 366
 COMMAND_TIMEOUT_SECONDS = 30
-SYNC_TIMEOUT_SECONDS = 300
-active_process: subprocess.Popen[bytes] | None = None
-JSON_FIELDS = (
-    "uid",
-    "title",
-    "start",
-    "end",
-    "start-long",
-    "end-long",
-    "location",
-    "description",
-    "calendar",
-    "all-day",
-    "status",
-)
+JSON_FIELDS = ("uid", "title", "start", "end", "start-long", "end-long", "location", "description", "calendar", "all-day", "status")
 
 
 class ProtocolError(Exception):
@@ -45,40 +32,6 @@ class ProtocolError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
-
-
-class CommandError(Exception):
-    def __init__(self, command: str, message: str) -> None:
-        super().__init__(message)
-        self.command = command
-        self.message = message
-
-
-def xdg_path(variable: str, fallback: str) -> Path:
-    value = os.environ.get(variable)
-    return Path(value).expanduser() if value else Path.home() / fallback
-
-
-def paths() -> dict[str, Path]:
-    config = xdg_path("XDG_CONFIG_HOME", ".config") / "omarchy-calendar"
-    data = xdg_path("XDG_DATA_HOME", ".local/share") / "omarchy-calendar"
-    state = xdg_path("XDG_STATE_HOME", ".local/state") / "omarchy-calendar"
-    return {
-        "config": config,
-        "data": data,
-        "state": state,
-        "khal_config": config / "khal.conf",
-        "vdirsyncer_config": config / "vdirsyncer.conf",
-        "remote_profile": config / "remote-profile.json",
-        "sync_status": state / "sync-status.json",
-        "operation_lock": state / "operation.lock",
-    }
-
-
-def require_object(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ProtocolError("invalid_request", "request must be a JSON object")
-    return value
 
 
 def validate_keys(request: dict[str, Any], allowed: set[str], required: set[str]) -> None:
@@ -90,20 +43,14 @@ def validate_keys(request: dict[str, Any], allowed: set[str], required: set[str]
         raise ProtocolError("invalid_request", f"missing fields: {', '.join(missing)}")
 
 
-def bounded_string(
-    request: dict[str, Any], key: str, *, maximum: int, required: bool = False
-) -> str | None:
+def bounded_string(request: dict[str, Any], key: str, maximum: int, *, required: bool = False) -> str | None:
     value = request.get(key)
     if value is None and not required:
         return None
-    if not isinstance(value, str):
-        raise ProtocolError("invalid_request", f"{key} must be a string")
-    if required and not value.strip():
-        raise ProtocolError("invalid_request", f"{key} must not be empty")
-    if len(value.encode("utf-8")) > maximum:
-        raise ProtocolError("invalid_request", f"{key} exceeds {maximum} bytes")
-    if "\x00" in value or "\n" in value or "\r" in value:
-        raise ProtocolError("invalid_request", f"{key} contains a forbidden control character")
+    if not isinstance(value, str) or (required and not value.strip()) or len(value.encode()) > maximum:
+        raise ProtocolError("invalid_request", f"{key} is invalid")
+    if any(character in value for character in "\x00\r\n"):
+        raise ProtocolError("invalid_request", f"{key} is invalid")
     return value
 
 
@@ -117,114 +64,6 @@ def parse_date(value: str, key: str) -> dt.date:
     return parsed
 
 
-def parse_event_time(value: str, key: str, all_day: bool) -> str:
-    if all_day:
-        return parse_date(value, key).isoformat()
-    if len(value) != 16 or value[10] != "T" or value[13] != ":":
-        raise ProtocolError("invalid_request", f"{key} must be YYYY-MM-DDTHH:MM")
-    parse_date(value[:10], key)
-    try:
-        hour = int(value[11:13])
-        minute = int(value[14:16])
-    except ValueError as error:
-        raise ProtocolError("invalid_request", f"{key} must be YYYY-MM-DDTHH:MM") from error
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ProtocolError("invalid_request", f"{key} must be YYYY-MM-DDTHH:MM")
-    return f"{value[:10]} {hour:02d}:{minute:02d}"
-
-
-def command_argv(executable: str, *arguments: str) -> list[str]:
-    resolved = shutil.which(executable)
-    if resolved is None:
-        raise CommandError(executable, f"{executable} is not installed")
-    return [resolved, *arguments]
-
-
-def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=1)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=1)
-
-
-def handle_termination(signum: int, _frame: Any) -> None:
-    process = active_process
-    if process is not None:
-        terminate_process_group(process)
-    raise SystemExit(128 + signum)
-
-
-def run_command(argv: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
-    global active_process
-    assert argv
-    assert timeout > 0
-    try:
-        process = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=os.environ.copy(),
-            start_new_session=True,
-        )
-    except OSError as error:
-        raise CommandError(Path(argv[0]).name, str(error)) from error
-
-    active_process = process
-    assert process.stdout is not None
-    assert process.stderr is not None
-    stdout_buffer = bytearray()
-    stderr_buffer = bytearray()
-    streams = selectors.DefaultSelector()
-    streams.register(process.stdout, selectors.EVENT_READ, (stdout_buffer, MAX_RESPONSE_BYTES))
-    streams.register(process.stderr, selectors.EVENT_READ, (stderr_buffer, MAX_STDERR_BYTES))
-    deadline = time.monotonic() + timeout
-    try:
-        while streams.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                terminate_process_group(process)
-                raise CommandError(Path(argv[0]).name, f"command timed out after {timeout} seconds")
-            for key, _events in streams.select(min(remaining, 0.25)):
-                buffer, limit = key.data
-                chunk = os.read(key.fd, 65536)
-                if not chunk:
-                    streams.unregister(key.fileobj)
-                    continue
-                buffer.extend(chunk)
-                if len(buffer) > limit:
-                    terminate_process_group(process)
-                    raise CommandError(Path(argv[0]).name, "command output exceeded its limit")
-        returncode = process.wait(timeout=1)
-    finally:
-        streams.close()
-        if process.poll() is None:
-            terminate_process_group(process)
-        active_process = None
-
-    stdout = stdout_buffer.decode("utf-8", errors="replace")
-    stderr = stderr_buffer.decode("utf-8", errors="replace")
-    result = subprocess.CompletedProcess(argv, returncode, stdout, stderr)
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
-        raise CommandError(Path(argv[0]).name, detail[:2048])
-    return result
-
-
-def khal_argv(*arguments: str) -> list[str]:
-    config = paths()["khal_config"]
-    if not config.is_file():
-        raise CommandError("khal", "calendar is not configured; run omarchy-calendar-setup local")
-    return command_argv("khal", "-c", str(config), "--no-color", *arguments)
-
-
 def json_options() -> list[str]:
     result: list[str] = []
     for field in JSON_FIELDS:
@@ -232,53 +71,47 @@ def json_options() -> list[str]:
     return result
 
 
-def normalize_khal_datetime(value: Any, all_day: bool) -> Any:
-    if not isinstance(value, str):
-        return value
-    if all_day:
-        return value[:10]
-    if len(value) == 16 and value[4] == "-" and value[7] == "-" and value[10] == " ":
-        return value[:10] + "T" + value[11:]
-    return value
-
-
 def normalize_event(row: dict[str, Any]) -> dict[str, Any]:
     all_day_value = row.get("all-day")
     if all_day_value not in ("True", "False"):
-        raise CommandError("khal", "khal returned an invalid all-day value")
+        raise ProtocolError("command_failed", "khal returned an invalid event")
     all_day = all_day_value == "True"
     calendar = row.get("calendar", "")
+    start = row.get("start-long", row.get("start", ""))
+    end = row.get("end-long", row.get("end", ""))
+    if isinstance(start, str) and not all_day and len(start) >= 16:
+        start = start[:10] + "T" + start[11:]
+    if isinstance(end, str) and not all_day and len(end) >= 16:
+        end = end[:10] + "T" + end[11:]
     event = {
-        "uid": row.get("uid", ""),
-        "title": row.get("title", ""),
-        "start": normalize_khal_datetime(row.get("start-long", row.get("start", "")), all_day),
-        "end": normalize_khal_datetime(row.get("end-long", row.get("end", "")), all_day),
-        "location": row.get("location", ""),
-        "description": row.get("description", ""),
-        "calendarId": calendar,
-        "calendarName": calendar,
-        "status": row.get("status", ""),
-        "allDay": all_day,
+        "uid": row.get("uid", ""), "title": row.get("title", ""), "start": start[:10] if all_day and isinstance(start, str) else start,
+        "end": end[:10] if all_day and isinstance(end, str) else end, "location": row.get("location", ""),
+        "description": row.get("description", ""), "calendarId": calendar, "calendarName": calendar,
+        "status": row.get("status", ""), "allDay": all_day,
     }
     if not all(isinstance(value, str) for key, value in event.items() if key != "allDay"):
-        raise CommandError("khal", "khal returned an invalid event field")
+        raise ProtocolError("command_failed", "khal returned an invalid event")
     return event
 
 
-def parse_khal_rows(output: str) -> list[dict[str, Any]]:
+def parse_khal_rows(output: bytes) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
-    for line in output.splitlines():
+    try:
+        text = output.decode()
+    except UnicodeDecodeError as error:
+        raise ProtocolError("command_failed", "khal returned invalid output") from error
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
             rows = json.loads(line)
         except json.JSONDecodeError as error:
-            raise CommandError("khal", "khal returned malformed JSON") from error
+            raise ProtocolError("command_failed", "khal returned malformed JSON") from error
         if not isinstance(rows, list):
-            raise CommandError("khal", "khal returned an unexpected JSON value")
+            raise ProtocolError("command_failed", "khal returned malformed JSON")
         for row in rows:
             if not isinstance(row, dict):
-                raise CommandError("khal", "khal returned an unexpected event value")
+                raise ProtocolError("command_failed", "khal returned malformed JSON")
             if row:
                 events.append(normalize_event(row))
                 if len(events) > MAX_EVENTS:
@@ -287,289 +120,141 @@ def parse_khal_rows(output: str) -> list[dict[str, Any]]:
 
 
 def request_list(request: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"action", "requestId", "start", "end", "calendars"}
-    validate_keys(request, allowed, {"action", "start", "end"})
-    start_text = bounded_string(request, "start", maximum=10, required=True)
-    end_text = bounded_string(request, "end", maximum=10, required=True)
-    assert start_text is not None
-    assert end_text is not None
-    start = parse_date(start_text, "start")
-    end = parse_date(end_text, "end")
-    days = (end - start).days + 1
+    validate_keys(request, {"action", "requestId", "start", "end", "calendars"}, {"action", "start", "end"})
+    start_text = bounded_string(request, "start", 10, required=True)
+    end_text = bounded_string(request, "end", 10, required=True)
+    assert start_text is not None and end_text is not None
+    days = (parse_date(end_text, "end") - parse_date(start_text, "start")).days + 1
     if days <= 0 or days > MAX_RANGE_DAYS:
         raise ProtocolError("invalid_request", f"inclusive date range must be 1 to {MAX_RANGE_DAYS} days")
-
-    calendars = request.get("calendars", [])
-    if not isinstance(calendars, list) or len(calendars) > 32:
-        raise ProtocolError("invalid_request", "calendars must be an array of at most 32 names")
-    arguments = ["list", "--once", *json_options()]
-    for index, calendar in enumerate(calendars):
-        if not isinstance(calendar, str) or not calendar or len(calendar.encode("utf-8")) > 128:
+    subscriptions = load_subscriptions()
+    requested = request.get("calendars", [])
+    if not isinstance(requested, list) or len(requested) > 16:
+        raise ProtocolError("invalid_request", "calendars must be an array of at most 16 IDs")
+    known = {item["id"] for item in subscriptions}
+    for index, calendar in enumerate(requested):
+        if not isinstance(calendar, str) or calendar not in known:
             raise ProtocolError("invalid_request", f"calendars[{index}] is invalid")
-        if any(character in calendar for character in "\x00\r\n"):
-            raise ProtocolError("invalid_request", f"calendars[{index}] is invalid")
+    if not subscriptions:
+        return {"ok": True, "events": []}
+    khal = shutil.which("khal")
+    if khal is None:
+        raise ProtocolError("dependency_missing", "khal is not installed")
+    arguments = [khal, "-c", str(paths()["khal_config"]), "--no-color", "list", "--once", *json_options()]
+    for calendar in requested:
         arguments.extend(("--include-calendar", calendar))
     arguments.extend((start_text, end_text))
-    output = run_command(khal_argv(*arguments), COMMAND_TIMEOUT_SECONDS).stdout
-    return {"ok": True, "events": parse_khal_rows(output)}
-
-
-def run_sync() -> dict[str, Any]:
-    current_paths = paths()
-    configured = current_paths["vdirsyncer_config"].is_file()
-    if not configured:
-        return {"attempted": False, "ok": True}
-    started = dt.datetime.now(dt.timezone.utc)
-    lock_path = current_paths["operation_lock"]
-    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with lock_path.open("a+b") as lock_stream:
-        os.chmod(lock_path, 0o600)
-        try:
-            fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            sync = {
-                "attempted": False,
-                "ok": False,
-                "at": started.isoformat(),
-                "error": "another account setup or synchronization is already running",
-            }
-            write_sync_status(sync)
-            return sync
-        try:
-            argv = command_argv("vdirsyncer", "-c", str(current_paths["vdirsyncer_config"]), "sync")
-            run_command(argv, SYNC_TIMEOUT_SECONDS)
-            sync = {"attempted": True, "ok": True, "at": started.isoformat()}
-        except CommandError as error:
-            sync = {"attempted": True, "ok": False, "at": started.isoformat(), "error": error.message}
-        write_sync_status(sync)
-        return sync
-
-
-def write_sync_status(status: dict[str, Any]) -> None:
-    status_path = paths()["sync_status"]
-    status_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=".sync-status-", dir=status_path.parent)
     try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(status, stream, ensure_ascii=False, separators=(",", ":"))
-            stream.write("\n")
-        os.replace(temporary, status_path)
-    except BaseException:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        Path(temporary).unlink(missing_ok=True)
-        raise
-
-
-def request_create(request: dict[str, Any]) -> dict[str, Any]:
-    allowed = {
-        "action", "requestId", "title", "start", "end", "allDay", "calendar",
-        "calendarId", "location", "description", "sync",
-    }
-    validate_keys(request, allowed, {"action", "title", "start", "end"})
-    title = bounded_string(request, "title", maximum=512, required=True)
-    start_text = bounded_string(request, "start", maximum=16, required=True)
-    end_text = bounded_string(request, "end", maximum=16, required=True)
-    calendar = bounded_string(request, "calendar", maximum=128)
-    calendar_id = bounded_string(request, "calendarId", maximum=128)
-    if calendar and calendar_id and calendar != calendar_id:
-        raise ProtocolError("invalid_request", "calendar and calendarId must match")
-    calendar = calendar or calendar_id
-    location = bounded_string(request, "location", maximum=1024)
-    description = bounded_string(request, "description", maximum=8192)
-    all_day = request.get("allDay", False)
-    sync_requested = request.get("sync", True)
-    if not isinstance(all_day, bool):
-        raise ProtocolError("invalid_request", "allDay must be a boolean")
-    if not isinstance(sync_requested, bool):
-        raise ProtocolError("invalid_request", "sync must be a boolean")
-    assert title is not None
-    assert start_text is not None
-    assert end_text is not None
-    start = parse_event_time(start_text, "start", all_day)
-    end = parse_event_time(end_text, "end", all_day)
-    if end <= start:
-        raise ProtocolError("invalid_request", "end must be after start")
-
-    arguments = ["new"]
-    if calendar:
-        arguments.extend(("--calendar", calendar))
-    if location:
-        arguments.extend(("--location", location))
-    arguments.extend(json_options())
-    arguments.extend((start, end, title))
-    if description:
-        arguments.extend(("::", description))
-    output = run_command(khal_argv(*arguments), COMMAND_TIMEOUT_SECONDS).stdout
+        output = run_bounded(arguments, timeout=COMMAND_TIMEOUT_SECONDS, output_limit=MAX_RESPONSE_BYTES)
+    except SubscriptionError as error:
+        raise ProtocolError(error.code, error.message) from error
     events = parse_khal_rows(output)
-    if len(events) != 1:
-        raise CommandError("khal", "khal did not confirm the created event")
-
-    # khal writes the vdir first. A failed remote synchronization must not turn
-    # a successful local creation into a failed create response.
-    sync = run_sync() if sync_requested else {"attempted": False, "ok": True}
-    return {"ok": True, "event": events[0], "sync": sync}
+    calendar_names = {item["id"]: item["name"] for item in subscriptions}
+    for event in events:
+        event["calendarName"] = calendar_names.get(event["calendarId"], event["calendarId"])
+    return {"ok": True, "events": events}
 
 
 def request_calendars(request: dict[str, Any]) -> dict[str, Any]:
     validate_keys(request, {"action", "requestId"}, {"action"})
-    output = run_command(khal_argv("printcalendars"), COMMAND_TIMEOUT_SECONDS).stdout
-    names = [line.strip() for line in output.splitlines() if line.strip()]
-    if len(names) > 128 or any(len(name.encode("utf-8")) > 128 for name in names):
-        raise ProtocolError("result_too_large", "calendar result exceeds protocol limits")
-    return {
-        "ok": True,
-        "calendars": [
-            {"id": name, "name": name, "writable": True}
-            for name in names
-        ],
-    }
+    return {"ok": True, "calendars": [{"id": item["id"], "name": item["name"], "writable": False, **({"color": item["color"]} if "color" in item else {})} for item in load_subscriptions()]}
 
 
 def executable_version(name: str) -> str | None:
-    resolved = shutil.which(name)
-    if resolved is None:
+    executable = shutil.which(name)
+    if executable is None:
         return None
     try:
-        output = run_command([resolved, "--version"], 5).stdout.strip()
-    except CommandError:
+        return run_bounded([executable, "--version"], timeout=5, output_limit=4096).decode(errors="replace").strip()[:256]
+    except SubscriptionError:
         return None
-    return output[:256]
 
 
-def read_remote_profile(path: Path) -> tuple[str | None, str | None]:
+def last_refresh() -> dict[str, Any] | None:
     try:
-        with path.open("rb") as stream:
-            raw = stream.read(16 * 1024 + 1)
-        if len(raw) > 16 * 1024:
-            return None, None
-        profile = json.loads(raw)
+        raw = paths()["status"].read_bytes()
+        value = json.loads(raw) if len(raw) <= 64 * 1024 else None
     except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None, None
-    if not isinstance(profile, dict):
-        return None, None
-    provider = profile.get("provider")
-    display_name = profile.get("displayName")
-    if provider not in ("google", "caldav", "icloud"):
-        provider = None
-    if not isinstance(display_name, str) or len(display_name.encode("utf-8")) > 256:
-        display_name = None
-    return provider, display_name
+        return None
+    if not isinstance(value, dict):
+        return None
+    # Status is written only from sanitized IDs, codes, and fixed messages.
+    return value
 
 
 def request_status(request: dict[str, Any]) -> dict[str, Any]:
     validate_keys(request, {"action", "requestId"}, {"action"})
-    current_paths = paths()
-    last_sync: dict[str, Any] | None = None
+    subscriptions = load_subscriptions()
     try:
-        with current_paths["sync_status"].open("rb") as stream:
-            raw = stream.read(16 * 1024 + 1)
-        if len(raw) <= 16 * 1024:
-            candidate = json.loads(raw)
-            if isinstance(candidate, dict):
-                last_sync = candidate
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        pass
-    sync_configured = current_paths["vdirsyncer_config"].is_file()
-    provider, display_name = read_remote_profile(current_paths["remote_profile"])
-    if not sync_configured:
-        provider = None
-        display_name = None
+        icalendar_version = importlib.metadata.version("icalendar")
+    except importlib.metadata.PackageNotFoundError:
+        icalendar_version = None
     return {
-        "ok": True,
-        "configured": current_paths["khal_config"].is_file(),
-        "syncConfigured": sync_configured,
-        "remoteAccount": {
-            "connected": sync_configured,
-            "provider": provider,
-            "displayName": display_name,
-            "setupMode": "replace" if sync_configured else "connect",
-            "singleProfile": True,
-        },
-        "versions": {"khal": executable_version("khal"), "vdirsyncer": executable_version("vdirsyncer")},
-        "lastSync": last_sync,
+        "ok": True, "configured": True, "readOnly": True,
+        "subscriptionCount": len(subscriptions), "subscriptions": subscriptions,
+        "versions": {"khal": executable_version("khal"), "python-icalendar": icalendar_version},
+        "lastRefresh": last_refresh(),
     }
 
 
 def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     request_id = request.get("requestId")
-    if request_id is not None and (
-        not isinstance(request_id, str) or len(request_id.encode("utf-8")) > 128
-    ):
+    if request_id is not None and (not isinstance(request_id, str) or len(request_id.encode()) > 128):
         raise ProtocolError("invalid_request", "requestId must be a string of at most 128 bytes")
     action = request.get("action")
-    if not isinstance(action, str):
-        raise ProtocolError("invalid_request", "action must be a string")
-    handlers = {
-        "list": request_list,
-        "create": request_create,
-        "calendars": request_calendars,
-        "status": request_status,
-    }
-    handler = handlers.get(action)
-    if handler is None:
-        raise ProtocolError("unknown_action", "action must be list, create, calendars, or status")
-    response = handler(request)
+    handlers = {"list": request_list, "calendars": request_calendars, "status": request_status}
+    if action in {"create", "update", "delete"}:
+        raise ProtocolError("read_only", "calendar subscriptions are read-only")
+    if not isinstance(action, str) or action not in handlers:
+        raise ProtocolError("unknown_action", "action must be list, calendars, or status")
+    response = handlers[action](request)
     if request_id is not None:
         response["requestId"] = request_id
     return response
 
 
-def read_request() -> dict[str, Any]:
-    # Quickshell keeps the process write channel open, so the protocol is one
-    # newline-delimited JSON request rather than an EOF-delimited document.
-    raw = sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 1)
-    if len(raw) > MAX_REQUEST_BYTES:
-        raise ProtocolError("request_too_large", f"request exceeds {MAX_REQUEST_BYTES} bytes")
-    if not raw.strip():
-        raise ProtocolError("invalid_json", "request is empty")
-    try:
-        return require_object(json.loads(raw))
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise ProtocolError("invalid_json", "request is not valid UTF-8 JSON") from error
-
-
 def encode_response(response: dict[str, Any]) -> bytes:
-    encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if len(encoded) > MAX_RESPONSE_BYTES:
-        fallback: dict[str, Any] = {
-            "ok": False,
-            "error": {"code": "response_too_large", "message": "response exceeds protocol limit"},
-        }
-        request_id = response.get("requestId")
-        if isinstance(request_id, str):
-            fallback["requestId"] = request_id
-        encoded = json.dumps(fallback, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return encoded
-
-
-def emit(response: dict[str, Any]) -> None:
-    sys.stdout.buffer.write(encode_response(response) + b"\n")
-    sys.stdout.buffer.flush()
+    encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(encoded) <= MAX_RESPONSE_BYTES:
+        return encoded
+    fallback: dict[str, Any] = {"ok": False, "error": {"code": "response_too_large", "message": "response exceeds protocol limit"}}
+    if isinstance(response.get("requestId"), str):
+        fallback["requestId"] = response["requestId"]
+    return json.dumps(fallback, separators=(",", ":")).encode()
 
 
 def main() -> int:
     request: dict[str, Any] = {}
+    response: dict[str, Any]
     try:
-        request = read_request()
+        raw = sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 1)
+        if len(raw) > MAX_REQUEST_BYTES:
+            raise ProtocolError("request_too_large", f"request exceeds {MAX_REQUEST_BYTES} bytes")
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ProtocolError("invalid_json", "request is not valid UTF-8 JSON") from error
+        if not isinstance(value, dict):
+            raise ProtocolError("invalid_request", "request must be a JSON object")
+        request = value
         response = dispatch(request)
-    except ProtocolError as error:
+    except (ProtocolError, SubscriptionError) as error:
         response = {"ok": False, "error": {"code": error.code, "message": error.message}}
-    except CommandError as error:
-        response = {"ok": False, "error": {"code": "command_failed", "message": error.message, "command": error.command}}
-    except Exception:  # noqa: BLE001 - stdout must remain valid protocol on every failure.
+    except Exception:  # noqa: BLE001 - protocol output must remain valid on every failure.
         response = {"ok": False, "error": {"code": "internal_error", "message": "unexpected backend failure"}}
     request_id = request.get("requestId")
-    if isinstance(request_id, str) and len(request_id.encode("utf-8")) <= 128:
+    if isinstance(request_id, str) and len(request_id.encode()) <= 128:
         response.setdefault("requestId", request_id)
-    emit(response)
+    sys.stdout.buffer.write(encode_response(response) + b"\n")
     return 0
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, handle_termination)
-    signal.signal(signal.SIGINT, handle_termination)
+    def stop(signum: int, _frame: Any) -> None:
+        from backend import subscriptions
+        if subscriptions.active_process is not None:
+            terminate_process_group(subscriptions.active_process)
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
     raise SystemExit(main())

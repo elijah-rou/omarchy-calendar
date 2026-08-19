@@ -1,43 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
-
 python -m compileall -q backend tests
-python - <<'PY'
-import py_compile
-
-for script in (
-    "bin/omarchy-calendar-backend",
-    "bin/omarchy-calendar-setup",
-    "bin/omarchy-calendar-setup-request",
-    "bin/omarchy-calendar-sync",
-):
-    py_compile.compile(script, doraise=True)
-PY
+python -m py_compile bin/omarchy-calendar
 python -m unittest discover -s tests -p 'test_*.py' -v
 ./scripts/validate-qml
-
 if command -v ruff >/dev/null 2>&1; then
   ruff check backend tests
-  for script in bin/omarchy-calendar-backend bin/omarchy-calendar-setup bin/omarchy-calendar-setup-request bin/omarchy-calendar-sync; do
-    ruff check --stdin-filename "$script.py" - < "$script"
-  done
+  ruff check --stdin-filename bin/omarchy-calendar.py - < bin/omarchy-calendar
 fi
-if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck bin/omarchy-calendar scripts/validate scripts/validate-qml
-fi
-
-for script in bin/omarchy-calendar bin/omarchy-calendar-backend bin/omarchy-calendar-setup bin/omarchy-calendar-setup-request bin/omarchy-calendar-sync scripts/validate scripts/validate-qml; do
-  test -x "$script" || { printf 'not executable: %s\n' "$script" >&2; exit 1; }
-done
-
-if command -v khal >/dev/null 2>&1; then
-  khal --version
-fi
-if command -v vdirsyncer >/dev/null 2>&1; then
-  vdirsyncer --version
-fi
-
+if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/validate scripts/validate-qml; fi
+for script in bin/omarchy-calendar scripts/validate scripts/validate-qml; do test -x "$script"; done
+python - <<'PY'
+import icalendar
+print("python-icalendar", icalendar.__version__)
+PY
+if command -v khal >/dev/null 2>&1; then khal --version; fi
 printf 'validation passed\n'

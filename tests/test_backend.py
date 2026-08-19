@@ -1,1214 +1,264 @@
 from __future__ import annotations
 
-import hashlib
-import importlib.util
 import json
 import os
-import shutil
-import signal
 import stat
 import subprocess
 import tempfile
-import time
 import unittest
+import urllib.request
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from backend import calendar_backend, subscriptions
+
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "bin" / "omarchy-calendar"
-BACKEND = ROOT / "bin" / "omarchy-calendar-backend"
-SETUP = ROOT / "bin" / "omarchy-calendar-setup"
-SETUP_REQUEST = ROOT / "bin" / "omarchy-calendar-setup-request"
-SYNC = ROOT / "bin" / "omarchy-calendar-sync"
+VALID_ICS = b"""BEGIN:VCALENDAR\r
+VERSION:2.0\r
+PRODID:-//test//EN\r
+BEGIN:VEVENT\r
+UID:event-1\r
+DTSTAMP:20300101T000000Z\r
+DTSTART:20300102T100000Z\r
+DTEND:20300102T110000Z\r
+SUMMARY:Planning\r
+END:VEVENT\r
+END:VCALENDAR\r
+"""
+
+FAKE_SECRET_TOOL = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+path = pathlib.Path(os.environ["KEYRING_PATH"])
+try: values = json.loads(path.read_text())
+except (FileNotFoundError, json.JSONDecodeError): values = {}
+key = json.dumps(args[2:] if args[0] == "store" else args[1:], separators=(",", ":"))
+if args[0] == "store":
+    values[key] = sys.stdin.read()
+    path.write_text(json.dumps(values, separators=(",", ":")))
+elif args[0] == "lookup":
+    if key not in values: raise SystemExit(1)
+    sys.stdout.write(values[key])
+elif args[0] == "clear":
+    values.pop(key, None)
+    path.write_text(json.dumps(values, separators=(",", ":")))
+else: raise SystemExit(2)
+'''
+
+FAKE_KHAL = r'''#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys, time
+args = sys.argv[1:]
+if "--version" in args:
+    print("khal, version test")
+elif "import" in args:
+    if os.environ.get("BLOCK_KHAL") == "1": time.sleep(60)
+    config = pathlib.Path(args[args.index("-c") + 1]).read_text()
+    calendar = args[args.index("--include-calendar") + 1]
+    for line in config.splitlines():
+        if line.startswith("path = "):
+            target = pathlib.Path(json.loads(line[7:]))
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(args[-1], target / "event-1.ics")
+            break
+elif "list" in args:
+    print(json.dumps([{"uid":"event-1","title":"Planning","start":"2030-01-02 10:00","end":"2030-01-02 11:00","calendar":"feed","all-day":"False"}]))
+else: raise SystemExit(2)
+'''
 
 
-class IsolatedEnvironment(unittest.TestCase):
-    def __init__(self, method_name: str = "runTest") -> None:
-        super().__init__(method_name)
-        self.temporary = tempfile.TemporaryDirectory()
-        self.bin = Path()
-        self.env: dict[str, str] = {}
-
+class Isolated(unittest.TestCase):
     def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.bin = root / "bin"
         self.bin.mkdir()
         self.env = os.environ.copy()
-        self.env.update(
-            {
-                "HOME": str(root / "home"),
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_DATA_HOME": str(root / "data"),
-                "XDG_STATE_HOME": str(root / "state"),
-                "XDG_CACHE_HOME": str(root / "cache"),
-                "PATH": f"{self.bin}:{self.env.get('PATH', '')}",
-                "COMMAND_LOG": str(root / "commands.log"),
-                "SECRET_INPUT_LOG": str(root / "secret-input.log"),
-                "KEYRING_PATH": str(root / "keyring.json"),
-                "SETUP_MARKER": str(root / "setup.marker"),
-                "CHILD_MARKER": str(root / "child.marker"),
-                "CLEAR_MARKER": str(root / "clear.marker"),
-            }
-        )
+        self.env.update({
+            "HOME": str(root / "home"), "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_DATA_HOME": str(root / "data"), "XDG_STATE_HOME": str(root / "state"),
+            "XDG_CACHE_HOME": str(root / "cache"), "KEYRING_PATH": str(root / "keyring.json"),
+            "PATH": f"{self.bin}:{self.env.get('PATH', '')}",
+        })
         Path(self.env["HOME"]).mkdir()
+        self.command("secret-tool", FAKE_SECRET_TOOL)
+        self.command("khal", FAKE_KHAL)
+        self.environment = mock.patch.dict(os.environ, self.env, clear=True)
+        self.environment.start()
 
     def tearDown(self) -> None:
+        self.environment.stop()
         self.temporary.cleanup()
 
-    def write_command(self, name: str, content: str) -> Path:
+    def command(self, name: str, content: str) -> None:
         path = self.bin / name
-        path.write_text(content, encoding="utf-8")
+        path.write_text(content)
         path.chmod(0o755)
-        return path
 
-    def run_backend(self, request: object, *, raw: bytes | None = None) -> dict[str, Any]:
-        payload = raw if raw is not None else json.dumps(request).encode()
+    def add(self, name: str = "Work", url: str = "https://calendar.example.test/private.ics", **extra: str) -> dict[str, Any]:
+        request: dict[str, Any] = {"action": "add", "name": name, "url": url, **extra}
+        with mock.patch.object(subscriptions, "fetch_feed", return_value=VALID_ICS):
+            return subscriptions.add_subscription(request, lambda *_args: None)
+
+    def protocol(self, request: dict[str, Any]) -> dict[str, Any]:
         result = subprocess.run(
-            [str(BACKEND)],
-            input=payload,
-            capture_output=True,
-            env=self.env,
-            timeout=10,
-            check=True,
+            [str(WRAPPER), "request"], input=json.dumps(request).encode() + b"\n",
+            capture_output=True, env=self.env, timeout=10, check=True,
         )
         self.assertEqual(result.stderr, b"")
         return json.loads(result.stdout)
 
 
-FAKE_KHAL = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys
-args = sys.argv[1:]
-log = pathlib.Path(os.environ["COMMAND_LOG"])
-with log.open("a") as stream:
-    stream.write("khal " + json.dumps(args) + "\n")
-if "--version" in args:
-    print("khal, version 0.14.0")
-elif "printcalendars" in args:
-    print("local")
-    print("work")
-elif "list" in args:
-    if os.environ.get("HUGE_OUTPUT") == "1":
-        print("x" * (2 * 1024 * 1024))
-        raise SystemExit(0)
-    print("[]")
-    print(json.dumps([{"uid":"one","title":"Standup","start":"2030-01-02 10:00","end":"2030-01-02 10:30","calendar":"work","all-day":"False"}]))
-    print("[]")
-elif "new" in args:
-    print(json.dumps([{"uid":"new","title":"Planning","start":"2030-01-03 09:00","end":"2030-01-03 10:00","calendar":"local","all-day":"False"}]))
-else:
-    raise SystemExit(2)
-'''
+class SubscriptionTests(Isolated):
+    def test_add_list_and_remove_keep_secrets_out_of_metadata(self) -> None:
+        result = self.add(username="person", password="private-password")
+        item = result["subscription"]
+        metadata_path = subscriptions.paths()["metadata"]
+        metadata = metadata_path.read_text()
+        self.assertIn("Work", metadata)
+        for secret in ("https://", "person", "private-password"):
+            self.assertNotIn(secret, metadata)
+        self.assertEqual(stat.S_IMODE(metadata_path.stat().st_mode), 0o600)
+        self.assertEqual(subscriptions.load_subscriptions(), [item])
+        removed = subscriptions.remove_subscription({"action": "remove", "id": item["id"]}, lambda *_args: None)
+        self.assertEqual(removed["removed"], item)
+        self.assertTrue(removed["cleanupComplete"])
+        self.assertEqual(subscriptions.load_subscriptions(), [])
+        keyring = json.loads(Path(self.env["KEYRING_PATH"]).read_text())
+        self.assertEqual(keyring, {})
 
-FAKE_VDIRSYNCER = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys
-args = sys.argv[1:]
-with pathlib.Path(os.environ["COMMAND_LOG"]).open("a") as stream:
-    stream.write("vdirsyncer " + json.dumps(args) + "\n")
-if "--version" in args:
-    print("vdirsyncer, version 0.20.0")
-elif os.environ.get("FAIL_SYNC") == "1" and "sync" in args:
-    print("remote unavailable", file=sys.stderr)
-    raise SystemExit(4)
-'''
+    def test_multiple_feeds_have_opaque_ids_and_readonly_config(self) -> None:
+        first = self.add("One")["subscription"]
+        second = self.add("Two", color="#112233")["subscription"]
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(len(first["id"]), 32)
+        config = subscriptions.paths()["khal_config"].read_text()
+        self.assertEqual(config.count("readonly = True"), 2)
+        self.assertNotIn("https://", config)
+        self.assertNotIn("password", config)
 
-STATEFUL_SECRET_TOOL_SETUP = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys, time
-args = sys.argv[1:]
-with pathlib.Path(os.environ["COMMAND_LOG"]).open("a") as stream:
-    stream.write("secret-tool " + json.dumps(args) + "\n")
-keyring_path = pathlib.Path(os.environ["KEYRING_PATH"])
-try:
-    keyring = json.loads(keyring_path.read_text())
-except (FileNotFoundError, json.JSONDecodeError):
-    keyring = {}
-if args and args[0] == "store":
-    secret_value = sys.stdin.read()
-    with pathlib.Path(os.environ["SECRET_INPUT_LOG"]).open("a") as stream:
-        stream.write(secret_value)
-    if os.environ.get("FAIL_SECRET_STORE") == "1":
-        raise SystemExit(3)
-    attributes = args[2:]
-    keyring[json.dumps(attributes, separators=(",", ":"))] = secret_value
-    keyring_path.write_text(json.dumps(keyring, separators=(",", ":")))
-elif args and args[0] == "lookup":
-    value = keyring.get(json.dumps(args[1:], separators=(",", ":")))
-    if value is None:
-        raise SystemExit(1)
-    sys.stdout.write(value)
-elif args and args[0] == "clear":
-    pathlib.Path(os.environ["CLEAR_MARKER"]).write_text(str(os.getpid()))
-    if os.environ.get("BLOCK_CLEAR") == "1":
-        time.sleep(60)
-    if os.environ.get("FAIL_SECRET_CLEAR") == "1":
-        raise SystemExit(4)
-    keyring.pop(json.dumps(args[1:], separators=(",", ":")), None)
-    keyring_path.write_text(json.dumps(keyring, separators=(",", ":")))
-else:
-    raise SystemExit(2)
-'''
+    def test_add_validates_before_commit_and_rolls_back(self) -> None:
+        with (
+            mock.patch.object(subscriptions, "fetch_feed", return_value=b"not a calendar"),
+            self.assertRaisesRegex(subscriptions.SubscriptionError, "valid iCalendar"),
+        ):
+            subscriptions.add_subscription({"action": "add", "name": "Bad", "url": "https://example.test/bad"}, lambda *_args: None)
+        self.assertEqual(subscriptions.load_subscriptions(), [])
+        self.assertEqual(json.loads(Path(self.env["KEYRING_PATH"]).read_text()), {})
 
-ADVANCED_VDIRSYNCER_SETUP = r'''#!/usr/bin/env python3
-import json, os, pathlib, re, subprocess, sys, time
-args = sys.argv[1:]
-with pathlib.Path(os.environ["COMMAND_LOG"]).open("a") as stream:
-    stream.write("vdirsyncer " + json.dumps(args) + "\n")
-config = pathlib.Path(args[args.index("-c") + 1])
-content = config.read_text()
-phase = args[-1]
-if os.environ.get("BLOCK_SETUP") == phase:
-    if os.environ.get("SPAWN_TERM_IGNORING_CHILD") == "1":
-        child_code = (
-            "import os,pathlib,signal,time;"
-            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
-            "pathlib.Path(os.environ['CHILD_MARKER']).write_text(str(os.getpid()));"
-            "time.sleep(60)"
-        )
-        subprocess.Popen([sys.executable, "-c", child_code])
-    pathlib.Path(os.environ["SETUP_MARKER"]).write_text(str(os.getpid()))
-    time.sleep(60)
-if os.environ.get("FAIL_SETUP") == phase:
-    print("remote rejected setup", file=sys.stderr)
-    raise SystemExit(130 if os.environ.get("CANCEL_SETUP") == "1" else 7)
-path_match = re.search(r'^path = (".*")$', content, re.MULTILINE)
-if path_match:
-    synced = pathlib.Path(json.loads(path_match.group(1)))
-    synced.mkdir(parents=True, exist_ok=True)
-    if phase == "sync":
-        candidate = synced / "remote.ics"
-        if os.environ.get("OVERSIZE_CANDIDATE") == "1":
-            with candidate.open("wb") as stream:
-                stream.truncate(256 * 1024 * 1024 + 1)
-        else:
-            candidate.write_text("candidate")
-failure = os.environ.get("GOOGLE_FAILURE_" + phase.upper()) or os.environ.get("GOOGLE_FAILURE")
-if failure:
-    print(failure, flush=True)
-    raise SystemExit(7)
-token_match = re.search(r'^token_file = (".*")$', content, re.MULTILINE)
-if token_match and phase == "discover":
-    if os.environ.get("EMIT_GOOGLE_URL") == "1":
-        print("diagnostic that must not be forwarded", flush=True)
-        print("https://accounts.google.com/o/oauth2/auth?client_id=desktop&scope=calendar", flush=True)
-    token = pathlib.Path(json.loads(token_match.group(1)))
-    token.write_text(json.dumps({"token": config.parent.name}))
-'''
+    def test_refresh_preserves_each_last_good_independently(self) -> None:
+        first = self.add("One")["subscription"]
+        second = self.add("Two")["subscription"]
+        first_file = subscriptions.paths()["calendars"] / first["id"] / "event-1.ics"
+        second_file = subscriptions.paths()["calendars"] / second["id"] / "event-1.ics"
+        before_first = first_file.read_bytes()
+        before_second = second_file.read_bytes()
 
+        def fetch(credential: dict[str, str]) -> bytes:
+            if "calendar.example.test" in credential["url"]:
+                raise subscriptions.SubscriptionError("fetch_failed", "calendar feed could not be fetched")
+            return VALID_ICS
 
-class BackendProtocolTests(IsolatedEnvironment):
-    def setUp(self) -> None:
-        super().setUp()
-        self.write_command("khal", FAKE_KHAL)
-        self.write_command("vdirsyncer", FAKE_VDIRSYNCER)
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
-        config.mkdir(parents=True)
-        (config / "khal.conf").write_text("test", encoding="utf-8")
-
-    def test_wrapper_dispatches_request_from_a_symlink(self) -> None:
-        link = self.bin / "omarchy-calendar"
-        link.symlink_to(WRAPPER)
-        result = subprocess.run(
-            [str(link), "request"],
-            input=b'{"action":"status","requestId":"wrapper"}\n',
-            capture_output=True,
-            env=self.env,
-            timeout=10,
-            check=True,
-        )
-        response = json.loads(result.stdout)
-        self.assertTrue(response["ok"])
-        self.assertEqual(response["requestId"], "wrapper")
-
-    def test_list_returns_normalized_bounded_events(self) -> None:
-        response = self.run_backend(
-            {"action": "list", "requestId": "r1", "start": "2030-01-01", "end": "2030-01-04", "calendars": ["work"]}
-        )
-        self.assertTrue(response["ok"])
-        self.assertEqual(response["requestId"], "r1")
-        self.assertEqual(response["events"][0]["title"], "Standup")
-        self.assertEqual(response["events"][0]["calendarId"], "work")
-        self.assertEqual(response["events"][0]["start"], "2030-01-02T10:00")
-        self.assertFalse(response["events"][0]["allDay"])
-        self.assertNotIn("all-day", response["events"][0])
-        log = Path(self.env["COMMAND_LOG"]).read_text()
-        self.assertIn('"--include-calendar", "work"', log)
-        self.assertNotIn("shell=True", log)
-
-    def test_qml_create_contract_uses_calendar_id_and_minute_times(self) -> None:
-        response = self.run_backend({
-            "action": "create",
-            "requestId": "qml-create",
-            "calendarId": "local",
-            "title": "Planning",
-            "start": "2030-01-03T09:00",
-            "end": "2030-01-03T10:00",
-            "allDay": False,
-            "sync": False,
-        })
-        self.assertTrue(response["ok"])
-        self.assertEqual(response["requestId"], "qml-create")
-        self.assertEqual(response["event"]["calendarId"], "local")
-        lines = Path(self.env["COMMAND_LOG"]).read_text().splitlines()
-        self.assertEqual(len(lines), 1)
-        self.assertTrue(lines[0].startswith("khal "))
-
-    def test_create_is_saved_before_failed_sync(self) -> None:
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
-        (config / "vdirsyncer.conf").write_text("test", encoding="utf-8")
-        self.env["FAIL_SYNC"] = "1"
-        response = self.run_backend(
-            {
-                "action": "create",
-                "title": "Planning",
-                "start": "2030-01-03T09:00",
-                "end": "2030-01-03T10:00",
-                "description": "Roadmap",
-            }
-        )
-        self.assertTrue(response["ok"])
-        self.assertEqual(response["event"]["uid"], "new")
-        self.assertFalse(response["sync"]["ok"])
-        lines = Path(self.env["COMMAND_LOG"]).read_text().splitlines()
-        self.assertTrue(lines[0].startswith("khal "))
-        self.assertTrue(lines[1].startswith("vdirsyncer "))
-        status = json.loads((Path(self.env["XDG_STATE_HOME"]) / "omarchy-calendar" / "sync-status.json").read_text())
+        # Give the second feed a distinguishable safe URL in its keyring.
+        credential = subscriptions.lookup_secret(second["id"])
+        credential["url"] = "https://second.example.test/feed"
+        subscriptions.store_secret(second["id"], credential)
+        with mock.patch.object(subscriptions, "fetch_feed", side_effect=fetch):
+            status = subscriptions.refresh_subscriptions()
         self.assertFalse(status["ok"])
+        self.assertEqual([entry["ok"] for entry in status["subscriptions"]], [False, True])
+        self.assertEqual(first_file.read_bytes(), before_first)
+        self.assertEqual(second_file.read_bytes(), before_second)
+        self.assertNotIn("https://", subscriptions.paths()["status"].read_text())
 
-    def test_calendars_and_status(self) -> None:
-        calendars = self.run_backend({"action": "calendars"})
-        self.assertEqual(calendars, {
-            "ok": True,
-            "calendars": [
-                {"id": "local", "name": "local", "writable": True},
-                {"id": "work", "name": "work", "writable": True},
-            ],
-        })
-        status = self.run_backend({"action": "status"})
-        self.assertTrue(status["configured"])
-        self.assertEqual(status["versions"]["khal"], "khal, version 0.14.0")
-        self.assertEqual(status["versions"]["vdirsyncer"], "vdirsyncer, version 0.20.0")
+    def test_url_and_basic_pair_validation(self) -> None:
+        invalid = ("http://example.test/feed", "https://user:pass@example.test/feed", "https://example.test/feed#secret", "https://example.test/%zz", " https://example.test/feed")
+        for url in invalid:
+            with self.subTest(url=url), self.assertRaises(subscriptions.SubscriptionError):
+                subscriptions.validated_url(url)
+        with self.assertRaisesRegex(subscriptions.SubscriptionError, "together"):
+            subscriptions.add_subscription({"action": "add", "name": "x", "url": "https://example.test", "username": "x"}, lambda *_args: None)
 
-    def test_rejects_unknown_fields_ranges_and_oversize_input(self) -> None:
-        unknown = self.run_backend({"action": "status", "requestId": "error-id", "extra": True})
-        self.assertEqual(unknown["error"]["code"], "invalid_request")
-        self.assertEqual(unknown["requestId"], "error-id")
-        one_day = self.run_backend({"action": "list", "start": "2030-01-01", "end": "2030-01-01"})
-        self.assertTrue(one_day["ok"])
-        wide = self.run_backend({"action": "list", "start": "2030-01-01", "end": "2032-01-01"})
-        self.assertEqual(wide["error"]["code"], "invalid_request")
-        oversize = self.run_backend({}, raw=b"{" + b" " * (64 * 1024))
-        self.assertEqual(oversize["error"]["code"], "request_too_large")
-
-    def test_oversize_response_preserves_request_id(self) -> None:
-        spec = importlib.util.spec_from_file_location("calendar_backend_test", ROOT / "backend" / "calendar_backend.py")
-        assert spec is not None
-        assert spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        module.MAX_RESPONSE_BYTES = 128  # pyright: ignore[reportAttributeAccessIssue]
-        encoded = module.encode_response({"ok": True, "requestId": "large-id", "events": ["x" * 512]})
-        response = json.loads(encoded)
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["requestId"], "large-id")
-        self.assertEqual(response["error"]["code"], "response_too_large")
-
-    def test_command_output_is_bounded(self) -> None:
-        self.env["HUGE_OUTPUT"] = "1"
-        response = self.run_backend({
-            "action": "list",
-            "requestId": "huge",
-            "start": "2030-01-01",
-            "end": "2030-01-02",
-        })
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["requestId"], "huge")
-        self.assertEqual(response["error"]["code"], "command_failed")
-        self.assertIn("output exceeded", response["error"]["message"])
-
-    def test_rejects_invalid_values_before_invoking_commands(self) -> None:
-        response = self.run_backend(
-            {"action": "create", "title": "bad\nname", "start": "2030-01-01T10:00", "end": "2030-01-01T11:00"}
+    def test_basic_authorization_is_stripped_on_cross_origin_redirect(self) -> None:
+        handler = subscriptions.SafeRedirectHandler()
+        request = urllib.request.Request(
+            "https://one.example.test/feed",
+            headers={"Authorization": "Basic secret", "Accept": "text/calendar"},
         )
-        self.assertEqual(response["error"]["code"], "invalid_request")
-        invalid_id = self.run_backend({"action": "status", "requestId": 7})
-        self.assertEqual(invalid_id["error"]["code"], "invalid_request")
-        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
+        redirected = handler.redirect_request(request, None, 302, "Found", {}, "https://two.example.test/feed")
+        self.assertNotIn("Authorization", redirected.headers)
+        self.assertEqual(redirected.headers["Accept"], "text/calendar")
+        same_origin = handler.redirect_request(request, None, 302, "Found", {}, "https://one.example.test/next")
+        self.assertEqual(same_origin.headers["Authorization"], "Basic secret")
 
+    def test_oversized_and_event_bounded_calendar(self) -> None:
+        with (
+            self.assertRaises(subscriptions.SubscriptionError),
+            mock.patch.object(subscriptions, "fetch_feed", return_value=b"x" * (subscriptions.MAX_FEED_BYTES + 1)),
+        ):
+            subscriptions.add_subscription({"action": "add", "name": "x", "url": "https://example.test/feed"}, lambda *_args: None)
+        many = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + b"BEGIN:VEVENT\r\nUID:x\r\nEND:VEVENT\r\n" * (subscriptions.MAX_EVENTS_PER_FEED + 1) + b"END:VCALENDAR\r\n"
+        with self.assertRaises(subscriptions.SubscriptionError):
+            subscriptions.validate_icalendar(many)
 
-class SetupTests(IsolatedEnvironment):
-    def setUp(self) -> None:
-        super().setUp()
-        self.write_command("secret-tool", "#!/bin/sh\nprintf '%s\\n' fake-secret\n")
+    def test_lock_excludes_refresh(self) -> None:
+        lock = subscriptions.acquire_lock()
+        try:
+            with self.assertRaisesRegex(subscriptions.SubscriptionError, "already running"):
+                subscriptions.refresh_subscriptions()
+        finally:
+            lock.close()
 
-    def run_setup(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [str(SETUP), *arguments],
-            capture_output=True,
-            text=True,
-            env=self.env,
-            timeout=10,
-            check=True,
-        )
-
-    def test_local_bootstrap_is_private_and_outside_repository(self) -> None:
-        self.run_setup("local")
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "khal.conf"
-        calendar = Path(self.env["XDG_DATA_HOME"]) / "omarchy-calendar" / "calendars" / "local"
-        self.assertTrue(config.is_file())
-        self.assertTrue(calendar.is_dir())
-        self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(calendar.stat().st_mode), 0o700)
-        self.assertIn("print_new = event", config.read_text())
-        self.assertFalse((Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf").exists())
-
-    def test_caldav_uses_argv_secret_fetch_not_a_stored_password(self) -> None:
-        self.run_setup(
-            "caldav",
-            "--url", "https://calendar.example.test/dav/",
-            "--username", "person@example.test",
-            "--password-command", "secret-tool",
-            "--password-arg", "lookup",
-            "--password-arg", "calendar",
-            "--configure-only",
-        )
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
-        content = config.read_text()
-        self.assertIn('password.fetch = ["command", "secret-tool", "lookup", "calendar"]', content)
-        self.assertNotIn("fake-secret", content)
-        self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
-
-    def test_local_rerun_preserves_remote_configuration(self) -> None:
-        self.run_setup(
-            "caldav", "--url", "https://example.test/", "--username", "me",
-            "--password-command", "secret-tool", "--configure-only",
-        )
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
-        before = config.read_text()
-        self.run_setup("local")
-        self.assertEqual(config.read_text(), before)
-        khal = config.with_name("khal.conf").read_text()
-        self.assertIn("[[synced]]", khal)
-
-    def test_icloud_and_google_templates_use_external_secret_fetch(self) -> None:
-        self.run_setup(
-            "icloud", "--username", "person@icloud.test", "--password-command", "secret-tool", "--configure-only"
-        )
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
-        self.assertIn("https://caldav.icloud.com/", config.read_text())
-        self.run_setup(
-            "google", "--client-id", "client-id.apps.googleusercontent.com",
-            "--client-secret-command", "secret-tool", "--configure-only",
-        )
-        content = config.read_text()
-        self.assertIn('type = "google_calendar"', content)
-        self.assertIn('client_secret.fetch = ["command", "secret-tool"]', content)
-        self.assertIn(str(Path(self.env["XDG_STATE_HOME"]) / "omarchy-calendar" / "google-token.json"), content)
-
-    def test_remote_setup_discovers_then_syncs_with_argv(self) -> None:
-        self.write_command("vdirsyncer", FAKE_VDIRSYNCER)
-        self.run_setup(
-            "caldav", "--url", "https://example.test/", "--username", "me",
-            "--password-command", "secret-tool",
-        )
-        lines = Path(self.env["COMMAND_LOG"]).read_text().splitlines()
-        self.assertIn("discover", lines[0])
-        self.assertIn("sync", lines[1])
-
-    def test_failed_remote_setup_preserves_active_configuration(self) -> None:
-        self.write_command("vdirsyncer", FAKE_VDIRSYNCER)
-        self.run_setup(
-            "caldav", "--url", "https://working.test/", "--username", "me",
-            "--password-command", "secret-tool", "--configure-only",
-        )
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
-        khal = config.with_name("khal.conf")
-        khal.write_text("CUSTOM-KHAL\n", encoding="utf-8")
-        synced = Path(self.env["XDG_DATA_HOME"]) / "omarchy-calendar" / "calendars" / "synced"
-        sentinel = synced / "existing.ics"
-        sentinel.write_text("existing", encoding="utf-8")
-        before = config.read_text()
-        before_khal = khal.read_text()
-        self.env["FAIL_SYNC"] = "1"
+    def test_subscription_protocol_list_is_bounded_ndjson(self) -> None:
+        self.add()
         result = subprocess.run(
-            [
-                str(SETUP), "caldav", "--url", "https://broken.test/", "--username", "me",
-                "--password-command", "secret-tool",
-            ],
-            capture_output=True,
-            text=True,
-            env=self.env,
-            timeout=10,
-            check=False,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(config.read_text(), before)
-        self.assertEqual(khal.read_text(), before_khal)
-        self.assertEqual(sentinel.read_text(), "existing")
-
-    @unittest.skipUnless(shutil.which("vdirsyncer"), "vdirsyncer is not installed")
-    def test_generated_caldav_config_loads_with_vdirsyncer_020(self) -> None:
-        executable = shutil.which("vdirsyncer")
-        assert executable is not None
-        version = subprocess.run(
-            [executable, "--version"], text=True, stdout=subprocess.PIPE, check=True
-        ).stdout.strip()
-        if version != "vdirsyncer, version 0.20.0":
-            self.skipTest(f"requires vdirsyncer 0.20.0, found {version}")
-        self.run_setup(
-            "caldav", "--url", "https://example.test/", "--username", "me",
-            "--password-command", "secret-tool", "--configure-only",
-        )
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
-        result = subprocess.run(
-            [executable, "-c", str(config), "showconfig"],
-            env=self.env,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=True,
-        )
-        parsed = json.loads(result.stdout)
-        remote = parsed["storages"][1]
-        self.assertEqual(remote["type"], "caldav")
-        self.assertEqual(remote["password.fetch"], ["command", "secret-tool"])
-
-
-class WidgetSetupRequestTests(IsolatedEnvironment):
-    def setUp(self) -> None:
-        super().setUp()
-        self.write_command("secret-tool", STATEFUL_SECRET_TOOL_SETUP)
-        self.write_command("vdirsyncer", ADVANCED_VDIRSYNCER_SETUP)
-
-    def run_setup_request(
-        self, request: object | None = None, *, raw: bytes | None = None
-    ) -> tuple[subprocess.CompletedProcess[bytes], list[dict[str, Any]]]:
-        payload = raw if raw is not None else json.dumps(request).encode() + b"\n"
-        result = subprocess.run(
-            [str(SETUP_REQUEST)],
-            input=payload,
-            capture_output=True,
-            env=self.env,
-            timeout=10,
-            check=True,
+            [str(WRAPPER), "subscriptions"], input=b'{"action":"list","requestId":"one"}\n',
+            capture_output=True, env=self.env, timeout=10, check=True,
         )
         lines = [json.loads(line) for line in result.stdout.splitlines()]
-        self.assertEqual(result.stderr, b"")
-        self.assertEqual(sum(line.get("final") is True for line in lines), 1)
-        self.assertTrue(lines[-1]["final"])
-        return result, lines
-
-    def start_setup_request(self, request: dict[str, Any]) -> subprocess.Popen[bytes]:
-        process = subprocess.Popen(
-            [str(SETUP_REQUEST)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=self.env,
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0]["final"])
+        self.assertEqual(lines[0]["requestId"], "one")
+        oversized = subprocess.run(
+            [str(WRAPPER), "subscriptions"], input=b"{" + b" " * subscriptions.MAX_REQUEST_BYTES,
+            capture_output=True, env=self.env, timeout=10, check=True,
         )
-        assert process.stdin is not None
-        process.stdin.write(json.dumps(request).encode() + b"\n")
-        process.stdin.close()
-        return process
-
-    def finish_setup_process(self, process: subprocess.Popen[bytes], timeout: float = 15) -> list[dict[str, Any]]:
-        process.wait(timeout=timeout)
-        assert process.stdout is not None
-        assert process.stderr is not None
-        stdout = process.stdout.read()
-        stderr = process.stderr.read()
-        process.stdout.close()
-        process.stderr.close()
-        self.assertEqual(process.returncode, 0)
-        self.assertEqual(stderr, b"")
-        lines = [json.loads(line) for line in stdout.splitlines()]
-        self.assertEqual(sum(line.get("final") is True for line in lines), 1)
-        return lines
-
-    def wait_for_file(self, path: Path, timeout: float = 10) -> None:
-        deadline = time.monotonic() + timeout
-        while not path.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
-        self.assertTrue(path.exists(), f"timed out waiting for {path}")
-
-    def keyring(self) -> dict[str, str]:
-        path = Path(self.env["KEYRING_PATH"])
-        return json.loads(path.read_text()) if path.exists() else {}
-
-    def test_caldav_stores_stdin_secret_and_emits_progress_then_one_final(self) -> None:
-        secret = "super-secret-value"
-        result, lines = self.run_setup_request({
-            "requestId": "setup-caldav",
-            "provider": "caldav",
-            "displayName": "Work",
-            "username": "person@example.test",
-            "url": "https://calendar.example.test/dav/",
-            "secret": secret,
-        })
-        final = lines[-1]
-        self.assertTrue(final["ok"])
-        self.assertFalse(final["replacesExisting"])
-        self.assertTrue(any(line.get("stage") == "discovering" for line in lines))
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
-        content = config.read_text()
-        self.assertIn('password.fetch = ["command", "secret-tool", "lookup", "service", "omarchy-calendar"', content)
-        self.assertNotIn(secret, content)
-        self.assertEqual(Path(self.env["SECRET_INPUT_LOG"]).read_text(), secret)
-        command_log = Path(self.env["COMMAND_LOG"]).read_text()
-        self.assertNotIn(secret, command_log)
-        self.assertNotIn(secret.encode(), result.stdout)
-        self.assertNotIn(secret.encode(), result.stderr)
-        self.assertIn('secret-tool ["store", "--label=Omarchy Calendar remote credential"', command_log)
-        self.assertIn('vdirsyncer ["-c"', command_log)
-        self.assertLess(max(len(line) for line in result.stdout.splitlines()), 16 * 1024)
-
-        status = self.run_backend({"action": "status"})
-        self.assertEqual(status["remoteAccount"], {
-            "connected": True,
-            "provider": "caldav",
-            "displayName": "Work",
-            "setupMode": "replace",
-            "singleProfile": True,
-        })
-
-    def test_keyring_attributes_are_exact_namespaced_and_stateful(self) -> None:
-        request = {
-            "requestId": "exact-one",
-            "provider": "caldav",
-            "username": "person@example.test",
-            "url": "https://calendar.example.test/dav/",
-            "secret": "first-value",
-        }
-        _, first = self.run_setup_request(request)
-        self.assertTrue(first[-1]["ok"])
-        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
-        profile = json.loads((config_root / "remote-profile.json").read_text())
-        account_id = hashlib.sha256(
-            b"caldav\nperson@example.test\nhttps://calendar.example.test/dav/"
-        ).hexdigest()[:32]
-        namespace = hashlib.sha256("\n".join((
-            str(config_root),
-            str(Path(self.env["XDG_DATA_HOME"]) / "omarchy-calendar"),
-            str(Path(self.env["XDG_STATE_HOME"]) / "omarchy-calendar"),
-        )).encode()).hexdigest()[:32]
-        attributes = [
-            "service", "omarchy-calendar",
-            "purpose", "remote-credential",
-            "installation", namespace,
-            "provider", "caldav",
-            "account", account_id,
-            "slot", profile["credentialSlot"],
-        ]
-        commands = [
-            json.loads(line.removeprefix("secret-tool "))
-            for line in Path(self.env["COMMAND_LOG"]).read_text().splitlines()
-            if line.startswith("secret-tool ")
-        ]
-        self.assertEqual(commands[0], ["store", "--label=Omarchy Calendar remote credential", *attributes])
-        config = (config_root / "vdirsyncer.conf").read_text()
-        self.assertIn(json.dumps(["command", "secret-tool", "lookup", *attributes]), config)
-        self.assertEqual(self.keyring(), {json.dumps(attributes, separators=(",", ":")): "first-value"})
-
-        request["requestId"] = "exact-two"
-        request["secret"] = "second-value"
-        _, second = self.run_setup_request(request)
-        self.assertTrue(second[-1]["ok"])
-        updated_profile = json.loads((config_root / "remote-profile.json").read_text())
-        updated_attributes = [*attributes[:-1], updated_profile["credentialSlot"]]
-        commands = [
-            json.loads(line.removeprefix("secret-tool "))
-            for line in Path(self.env["COMMAND_LOG"]).read_text().splitlines()
-            if line.startswith("secret-tool ")
-        ]
-        self.assertEqual(commands[-1], ["clear", *attributes])
-        self.assertEqual(self.keyring(), {
-            json.dumps(updated_attributes, separators=(",", ":")): "second-value"
-        })
-
-    def test_missing_profile_failed_same_account_replacement_preserves_active_credential(self) -> None:
-        request = {
-            "requestId": "active",
-            "provider": "caldav",
-            "username": "same@example.test",
-            "url": "https://same.example.test/dav",
-            "secret": "active-value",
-        }
-        _, first = self.run_setup_request(request)
-        self.assertTrue(first[-1]["ok"])
-        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
-        config_path = config_root / "vdirsyncer.conf"
-        before_config = config_path.read_bytes()
-        before_keyring = self.keyring()
-        (config_root / "remote-profile.json").unlink()
-
-        self.env["FAIL_SETUP"] = "sync"
-        request["requestId"] = "failed-replacement"
-        request["secret"] = "candidate-value"
-        _, failed = self.run_setup_request(request)
-        self.assertFalse(failed[-1]["ok"])
-        self.assertEqual(config_path.read_bytes(), before_config)
-        self.assertEqual(self.keyring(), before_keyring)
-        clear_commands = [
-            json.loads(line.removeprefix("secret-tool "))
-            for line in Path(self.env["COMMAND_LOG"]).read_text().splitlines()
-            if line.startswith('secret-tool ["clear"')
-        ]
-        self.assertEqual(len(clear_commands), 1)
-        self.assertNotEqual(clear_commands[0][1:], json.loads(next(iter(before_keyring))))
-
-    def test_separate_xdg_installations_do_not_share_credentials(self) -> None:
-        request = {
-            "requestId": "root-one",
-            "provider": "icloud",
-            "username": "same@icloud.test",
-            "secret": "root-one-value",
-        }
-        _, first = self.run_setup_request(request)
-        self.assertTrue(first[-1]["ok"])
-        second_env = self.env.copy()
-        root = Path(self.temporary.name) / "second-root"
-        for variable, name in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state")):
-            second_env[variable] = str(root / name)
-        request["requestId"] = "root-two"
-        request["secret"] = "root-two-value"
-        result = subprocess.run(
-            [str(SETUP_REQUEST)],
-            input=json.dumps(request).encode() + b"\n",
-            capture_output=True,
-            env=second_env,
-            timeout=10,
-            check=True,
-        )
-        self.assertTrue(json.loads(result.stdout.splitlines()[-1])["ok"])
-        keyring = self.keyring()
-        self.assertEqual(set(keyring.values()), {"root-one-value", "root-two-value"})
-        attributes = [json.loads(key) for key in keyring]
-        installation_values = [value[value.index("installation") + 1] for value in attributes]
-        self.assertEqual(len(set(installation_values)), 2)
-
-    def write_google_client_file(
-        self,
-        name: str = "google-client.json",
-        *,
-        document: object | None = None,
-        raw: bytes | None = None,
-    ) -> Path:
-        path = Path(self.temporary.name) / name
-        if raw is not None:
-            path.write_bytes(raw)
-        else:
-            value = document if document is not None else {
-                "installed": {
-                    "client_id": "imported.apps.googleusercontent.com",
-                    "project_id": "calendar-test",
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                    "client_secret": "imported-client-secret",
-                    "redirect_uris": ["http://localhost"],
-                }
-            }
-            path.write_text(json.dumps(value), encoding="utf-8")
-        return path
-
-    def test_google_import_uses_file_secret_without_leaking_or_deleting_source(self) -> None:
-        client_file = self.write_google_client_file()
-        source_before = client_file.read_bytes()
-        secret = "imported-client-secret"
-        result, lines = self.run_setup_request({
-            "requestId": "google-import",
-            "provider": "google",
-            "displayName": "Personal Google",
-            "clientFile": str(client_file),
-        })
-
-        self.assertTrue(lines[-1]["ok"])
-        self.assertTrue(client_file.is_file())
-        self.assertEqual(client_file.read_bytes(), source_before)
-        self.assertEqual(Path(self.env["SECRET_INPUT_LOG"]).read_text(), secret)
-        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
-        config = (config_root / "vdirsyncer.conf").read_text()
-        profile = (config_root / "remote-profile.json").read_text()
-        status = self.run_backend({"action": "status", "requestId": "status-after-google-import"})
-        command_log = Path(self.env["COMMAND_LOG"]).read_text()
-        self.assertIn('client_id = "imported.apps.googleusercontent.com"', config)
-        self.assertNotIn(secret, config)
-        self.assertNotIn(secret, profile)
-        self.assertNotIn(secret, command_log)
-        self.assertNotIn(secret, json.dumps(status))
-        self.assertNotIn(secret.encode(), result.stdout + result.stderr)
-        self.assertNotIn("clientFile", profile)
-
-    def test_google_client_file_rejects_malformed_noninstalled_and_invalid_values(self) -> None:
-        cases = {
-            "malformed.json": b'{"installed":',
-            "web.json": json.dumps({
-                "web": {"client_id": "web-id", "client_secret": "must-not-leak-web-secret"}
-            }).encode(),
-            "missing-secret.json": json.dumps({
-                "installed": {"client_id": "desktop-id"}
-            }).encode(),
-            "multiline-secret.json": json.dumps({
-                "installed": {"client_id": "desktop-id", "client_secret": "line-one\nline-two"}
-            }).encode(),
-            "multiline-client-id.json": json.dumps({
-                "installed": {"client_id": "desktop\nid", "client_secret": "secret"}
-            }).encode(),
-            "oversize-client-id.json": json.dumps({
-                "installed": {"client_id": "i" * 513, "client_secret": "secret"}
-            }).encode(),
-            "oversize-secret.json": json.dumps({
-                "installed": {"client_id": "desktop-id", "client_secret": "s" * (16 * 1024 + 1)}
-            }).encode(),
-        }
-        for index, (name, raw) in enumerate(cases.items()):
-            with self.subTest(name=name):
-                path = self.write_google_client_file(name, raw=raw)
-                result, lines = self.run_setup_request({
-                    "requestId": f"invalid-google-json-{index}",
-                    "provider": "google",
-                    "clientFile": str(path),
-                })
-                self.assertFalse(lines[-1]["ok"])
-                self.assertEqual(lines[-1]["error"]["code"], "invalid_client_file")
-                self.assertNotIn(b"must-not-leak-web-secret", result.stdout + result.stderr)
-        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
-
-    def test_google_client_file_rejects_oversize_symlink_and_nonregular_file(self) -> None:
-        oversize = Path(self.temporary.name) / "oversize.json"
-        with oversize.open("wb") as stream:
-            stream.truncate(64 * 1024 + 1)
-        target = self.write_google_client_file("target.json")
-        symlink = Path(self.temporary.name) / "linked.json"
-        symlink.symlink_to(target)
-        directory = Path(self.temporary.name) / "directory.json"
-        directory.mkdir()
-
-        for index, path in enumerate((oversize, symlink, directory)):
-            with self.subTest(path=path.name):
-                _, lines = self.run_setup_request({
-                    "requestId": f"unsafe-google-file-{index}",
-                    "provider": "google",
-                    "clientFile": str(path),
-                })
-                self.assertFalse(lines[-1]["ok"])
-                self.assertEqual(lines[-1]["error"]["code"], "invalid_client_file")
-        self.assertTrue(target.is_file())
-        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
-
-    def test_google_client_file_path_bounds_and_provider_rules(self) -> None:
-        client_file = self.write_google_client_file()
-        requests = (
-            {
-                "requestId": "relative-google-file",
-                "provider": "google",
-                "clientFile": "Downloads/client.json",
-            },
-            {
-                "requestId": "oversize-google-path",
-                "provider": "google",
-                "clientFile": "/" + "x" * 4096,
-            },
-            {
-                "requestId": "mixed-google-input",
-                "provider": "google",
-                "clientFile": str(client_file),
-                "clientId": "manual.apps.googleusercontent.com",
-                "secret": "manual-secret",
-            },
-            {
-                "requestId": "icloud-google-file",
-                "provider": "icloud",
-                "username": "person@icloud.test",
-                "secret": "app-password",
-                "clientFile": str(client_file),
-            },
-        )
-        for request in requests:
-            with self.subTest(request_id=request["requestId"]):
-                _, lines = self.run_setup_request(request)
-                self.assertFalse(lines[-1]["ok"])
-                self.assertEqual(lines[-1]["error"]["code"], "invalid_request")
-        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
-
-    def test_google_browser_event_is_validated_and_unrelated_output_is_not_forwarded(self) -> None:
-        self.env["EMIT_GOOGLE_URL"] = "1"
-        result, lines = self.run_setup_request({
-            "requestId": "google-browser",
-            "provider": "google",
-            "clientId": "desktop.apps.googleusercontent.com",
-            "secret": "oauth-secret",
-        })
-        browser = [line for line in lines if line.get("type") == "browser"]
-        self.assertEqual(len(browser), 1)
-        self.assertEqual(browser[0]["requestId"], "google-browser")
-        self.assertTrue(browser[0]["url"].startswith("https://accounts.google.com/"))
-        self.assertNotIn(b"diagnostic that must not be forwarded", result.stdout)
-
-    def test_google_failure_reports_safe_calendar_api_guidance(self) -> None:
-        self.env["GOOGLE_FAILURE"] = "Google Calendar API has not been used in project 123"
-        result, lines = self.run_setup_request({
-            "requestId": "google-calendar-api",
-            "provider": "google",
-            "clientId": "desktop.apps.googleusercontent.com",
-            "secret": "oauth-secret",
-        })
-        response = lines[-1]
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error"]["code"], "command_failed")
-        self.assertEqual(
-            response["error"]["message"],
-            "Enable Google Calendar API in this OAuth client's Google Cloud project, then connect again",
-        )
-        self.assertNotIn(b"Google Calendar API has not been used", result.stdout)
-        self.assertNotIn(b"oauth-secret", result.stdout)
-
-    def test_google_sync_failure_reports_safe_dav_guidance(self) -> None:
-        self.env["GOOGLE_FAILURE_SYNC"] = "error: Unknown error occurred: Not Found"
-        result, lines = self.run_setup_request({
-            "requestId": "google-sync-not-found",
-            "provider": "google",
-            "clientId": "desktop.apps.googleusercontent.com",
-            "secret": "oauth-secret",
-        })
-        response = lines[-1]
-        self.assertFalse(response["ok"])
-        self.assertEqual(
-            response["error"]["message"],
-            "Google Calendar was not found; open calendar.google.com once, confirm Calendar API is enabled, and reconnect",
-        )
-        self.assertNotIn(b"Unknown error occurred", result.stdout)
-        self.assertNotIn(b"oauth-secret", result.stdout)
-
-    def test_oversize_candidate_fails_before_commit_and_clears_credential(self) -> None:
-        self.env["OVERSIZE_CANDIDATE"] = "1"
-        _, lines = self.run_setup_request({
-            "requestId": "oversize-candidate",
-            "provider": "caldav",
-            "username": "person@example.test",
-            "url": "https://calendar.example.test/dav",
-            "secret": "candidate-value",
-        })
-        self.assertFalse(lines[-1]["ok"])
-        self.assertEqual(lines[-1]["error"]["code"], "candidate_too_large")
-        self.assertEqual(self.keyring(), {})
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf"
-        self.assertFalse(config.exists())
-
-    def test_cleanup_failure_is_reported_without_reverting_commit(self) -> None:
-        base = {
-            "requestId": "cleanup-one",
-            "provider": "icloud",
-            "username": "first@icloud.test",
-            "secret": "first-value",
-        }
-        _, first = self.run_setup_request(base)
-        self.assertTrue(first[-1]["ok"])
-        self.env["FAIL_SECRET_CLEAR"] = "1"
-        replacement = {
-            "requestId": "cleanup-two",
-            "provider": "icloud",
-            "username": "second@icloud.test",
-            "secret": "second-value",
-        }
-        _, second = self.run_setup_request(replacement)
-        self.assertTrue(second[-1]["ok"])
-        self.assertFalse(second[-1]["cleanupComplete"])
-        profile = json.loads(
-            (Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "remote-profile.json").read_text()
-        )
-        self.assertEqual(profile["displayName"], "Icloud")
-
-    def test_cancellation_during_commit_rolls_back_active_state(self) -> None:
-        base = {
-            "requestId": "commit-base",
-            "provider": "caldav",
-            "username": "base@example.test",
-            "url": "https://base.example.test/dav",
-            "secret": "base-value",
-        }
-        _, first = self.run_setup_request(base)
-        self.assertTrue(first[-1]["ok"])
-        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
-        before = {
-            name: (config_root / name).read_bytes()
-            for name in ("vdirsyncer.conf", "khal.conf", "remote-profile.json")
-        }
-        before_keyring = self.keyring()
-
-        from backend import remote_setup
-
-        replacement = {
-            "requestId": "commit-cancel",
-            "provider": "caldav",
-            "username": "replacement@example.test",
-            "url": "https://replacement.example.test/dav",
-            "secret": "replacement-value",
-        }
-        validated, secret_buffer = remote_setup.validate_request(replacement)
-        real_atomic_write = remote_setup.atomic_write
-        cancellation_raised = False
-
-        def cancel_profile_write(path: Path, content: bytes, mode: int = 0o600) -> None:
-            nonlocal cancellation_raised
-            if path.name == "remote-profile.json" and not cancellation_raised:
-                cancellation_raised = True
-                raise remote_setup.SetupCancelled()
-            real_atomic_write(path, content, mode)
-
-        with (
-            mock.patch.dict(os.environ, self.env, clear=True),
-            mock.patch.object(remote_setup, "atomic_write", cancel_profile_write),
-            self.assertRaises(remote_setup.SetupCancelled),
-        ):
-            remote_setup.setup_remote(validated, secret_buffer, lambda *_args: None, lambda _url: None)
-        self.assertTrue(cancellation_raised)
-        for name, content in before.items():
-            self.assertEqual((config_root / name).read_bytes(), content)
-        self.assertEqual(self.keyring(), before_keyring)
-
-    def test_signal_after_commit_returns_success_and_marks_cleanup_incomplete(self) -> None:
-        _, first = self.run_setup_request({
-            "requestId": "signal-base",
-            "provider": "icloud",
-            "username": "base@icloud.test",
-            "secret": "base-value",
-        })
-        self.assertTrue(first[-1]["ok"])
-        Path(self.env["CLEAR_MARKER"]).unlink(missing_ok=True)
-        self.env["BLOCK_CLEAR"] = "1"
-        process = self.start_setup_request({
-            "requestId": "signal-replacement",
-            "provider": "icloud",
-            "username": "replacement@icloud.test",
-            "secret": "replacement-value",
-        })
-        self.wait_for_file(Path(self.env["CLEAR_MARKER"]))
-        process.send_signal(signal.SIGTERM)
-        lines = self.finish_setup_process(process)
-        self.assertTrue(lines[-1]["ok"])
-        self.assertFalse(lines[-1]["cleanupComplete"])
-        profile = json.loads(
-            (Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "remote-profile.json").read_text()
-        )
-        self.assertEqual(profile["accountId"], hashlib.sha256(b"icloud\nreplacement@icloud.test").hexdigest()[:32])
-
-    def test_real_sigterm_cleans_entire_process_group_and_rolls_back(self) -> None:
-        self.env["BLOCK_SETUP"] = "discover"
-        self.env["SPAWN_TERM_IGNORING_CHILD"] = "1"
-        process = self.start_setup_request({
-            "requestId": "process-tree",
-            "provider": "caldav",
-            "username": "person@example.test",
-            "url": "https://calendar.example.test/dav",
-            "secret": "candidate-value",
-        })
-        self.wait_for_file(Path(self.env["SETUP_MARKER"]))
-        self.wait_for_file(Path(self.env["CHILD_MARKER"]))
-        child_pid = int(Path(self.env["CHILD_MARKER"]).read_text())
-        process.send_signal(signal.SIGTERM)
-        lines = self.finish_setup_process(process, timeout=20)
-        self.assertFalse(lines[-1]["ok"])
-        self.assertEqual(lines[-1]["error"]["code"], "cancelled")
-        deadline = time.monotonic() + 5
-        while Path(f"/proc/{child_pid}").exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.assertFalse(Path(f"/proc/{child_pid}").exists())
-        self.assertEqual(self.keyring(), {})
-
-    def test_setup_lock_excludes_scheduled_sync(self) -> None:
-        config_root = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
-        config_root.mkdir(parents=True)
-        (config_root / "vdirsyncer.conf").write_text("active")
-        self.env["BLOCK_SETUP"] = "discover"
-        process = self.start_setup_request({
-            "requestId": "lock-holder",
-            "provider": "caldav",
-            "username": "person@example.test",
-            "url": "https://calendar.example.test/dav",
-            "secret": "candidate-value",
-        })
-        self.wait_for_file(Path(self.env["SETUP_MARKER"]))
-        sync = subprocess.run([str(SYNC)], env=self.env, capture_output=True, timeout=10, check=False)
-        self.assertEqual(sync.returncode, 1)
-        self.assertIn(b"another account setup or synchronization", sync.stderr)
-        process.send_signal(signal.SIGTERM)
-        self.finish_setup_process(process, timeout=20)
-
-    def test_failed_or_cancelled_setup_cleans_candidate_and_preserves_active_state(self) -> None:
-        _, first_lines = self.run_setup_request({
-            "requestId": "first",
-            "provider": "caldav",
-            "username": "first@example.test",
-            "url": "https://first.example.test/",
-            "secret": "first-secret",
-        })
-        self.assertTrue(first_lines[-1]["ok"])
-        config_dir = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
-        data_dir = Path(self.env["XDG_DATA_HOME"]) / "omarchy-calendar" / "calendars" / "synced"
-        before_config = (config_dir / "vdirsyncer.conf").read_bytes()
-        before_khal = (config_dir / "khal.conf").read_bytes()
-        before_profile = (config_dir / "remote-profile.json").read_bytes()
-        before_data = (data_dir / "remote.ics").read_bytes()
-
-        self.env["FAIL_SETUP"] = "discover"
-        self.env["CANCEL_SETUP"] = "1"
-        result, failed_lines = self.run_setup_request({
-            "requestId": "cancelled",
-            "provider": "google",
-            "displayName": "Personal",
-            "clientId": "client.apps.googleusercontent.com",
-            "secret": "super-secret-value",
-        })
-        final = failed_lines[-1]
-        self.assertFalse(final["ok"])
-        self.assertEqual(final["error"]["code"], "cancelled")
-        self.assertNotIn(b"super-secret-value", result.stdout + result.stderr)
-        self.assertEqual((config_dir / "vdirsyncer.conf").read_bytes(), before_config)
-        self.assertEqual((config_dir / "khal.conf").read_bytes(), before_khal)
-        self.assertEqual((config_dir / "remote-profile.json").read_bytes(), before_profile)
-        self.assertEqual((data_dir / "remote.ics").read_bytes(), before_data)
-        command_lines = Path(self.env["COMMAND_LOG"]).read_text().splitlines()
-        self.assertTrue(command_lines[-1].startswith('secret-tool ["clear"'))
-        tokens = list((Path(self.env["XDG_STATE_HOME"]) / "omarchy-calendar").glob("google-token-*.json"))
-        self.assertEqual(tokens, [])
-
-    def test_successful_google_replacement_uses_isolated_token_and_clears_only_old_state(self) -> None:
-        state = Path(self.env["XDG_STATE_HOME"]) / "omarchy-calendar"
-        _, first_lines = self.run_setup_request({
-            "requestId": "google-one",
-            "provider": "google",
-            "clientId": "one.apps.googleusercontent.com",
-            "secret": "client-one-secret",
-        })
-        self.assertTrue(first_lines[-1]["ok"])
-        first_tokens = list(state.glob("google-token-*.json"))
-        self.assertEqual(len(first_tokens), 1)
-        first_token = first_tokens[0]
-        first_token_content = first_token.read_bytes()
-
-        self.env["FAIL_SETUP"] = "sync"
-        _, failed_lines = self.run_setup_request({
-            "requestId": "google-two-failed",
-            "provider": "google",
-            "clientId": "two.apps.googleusercontent.com",
-            "secret": "client-two-secret",
-        })
-        self.assertFalse(failed_lines[-1]["ok"])
-        self.assertTrue(first_token.is_file())
-        self.assertEqual(first_token.read_bytes(), first_token_content)
-        self.assertEqual(len(list(state.glob("google-token-*.json"))), 1)
-
-        self.env.pop("FAIL_SETUP")
-        _, replacement_lines = self.run_setup_request({
-            "requestId": "google-two-success",
-            "provider": "google",
-            "displayName": "Second Google",
-            "clientId": "two.apps.googleusercontent.com",
-            "secret": "client-two-secret",
-        })
-        final = replacement_lines[-1]
-        self.assertTrue(final["ok"])
-        self.assertTrue(final["replacesExisting"])
-        self.assertFalse(first_token.exists())
-        new_tokens = list(state.glob("google-token-*.json"))
-        self.assertEqual(len(new_tokens), 1)
-        config = (Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar" / "vdirsyncer.conf").read_text()
-        self.assertIn(str(new_tokens[0]), config)
-        self.assertNotIn(str(first_token), config)
-        clear_lines = [
-            line for line in Path(self.env["COMMAND_LOG"]).read_text().splitlines()
-            if line.startswith('secret-tool ["clear"')
-        ]
-        self.assertGreaterEqual(len(clear_lines), 2)
-
-    def test_caldav_requires_safe_https_but_allows_private_hosts(self) -> None:
-        invalid_urls = (
-            "http://calendar.example.test/dav",
-            "https://person:password@calendar.example.test/dav",
-            "https://calendar.example.test/dav#fragment",
-            "https://calendar.example.test:bad/dav",
-            "https://calendar.example.test/%zz",
-            " https://calendar.example.test/dav",
-            "https://calendar.example.test\\@evil.test/dav",
-        )
-        for index, url in enumerate(invalid_urls):
-            with self.subTest(url=url):
-                _, lines = self.run_setup_request({
-                    "requestId": f"invalid-url-{index}",
-                    "provider": "caldav",
-                    "username": "person@example.test",
-                    "url": url,
-                    "secret": "candidate-value",
-                })
-                self.assertFalse(lines[-1]["ok"])
-                self.assertEqual(lines[-1]["error"]["code"], "invalid_request")
-        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
-
-        _, private = self.run_setup_request({
-            "requestId": "private-url",
-            "provider": "caldav",
-            "username": "person@example.test",
-            "url": "https://calendar.lan:8443/dav",
-            "secret": "candidate-value",
-        })
-        self.assertTrue(private[-1]["ok"])
-
-    def test_request_is_newline_delimited_bounded_and_provider_specific(self) -> None:
-        _, no_newline = self.run_setup_request(raw=b'{"requestId":"x"}')
-        self.assertEqual(no_newline[-1]["error"]["code"], "invalid_json")
-        _, oversized = self.run_setup_request(raw=b"{" + b" " * (64 * 1024) + b"\n")
-        self.assertEqual(oversized[-1]["error"]["code"], "request_too_large")
-        _, invalid = self.run_setup_request({
-            "requestId": "bad-fields",
-            "provider": "icloud",
-            "username": "person@icloud.test",
-            "url": "https://must-not-be-accepted.test/",
-            "secret": "app-password",
-        })
-        self.assertEqual(invalid[-1]["error"]["code"], "invalid_request")
-        self.assertFalse(Path(self.env["COMMAND_LOG"]).exists())
+        self.assertEqual(json.loads(oversized.stdout)["error"]["code"], "request_too_large")
 
 
-class SyncTests(IsolatedEnvironment):
-    def test_sync_records_bounded_failure(self) -> None:
-        self.write_command("vdirsyncer", FAKE_VDIRSYNCER)
-        config = Path(self.env["XDG_CONFIG_HOME"]) / "omarchy-calendar"
-        config.mkdir(parents=True)
-        (config / "vdirsyncer.conf").write_text("test", encoding="utf-8")
-        self.env["FAIL_SYNC"] = "1"
-        result = subprocess.run([str(SYNC)], env=self.env, capture_output=True, timeout=10, check=False)
-        self.assertEqual(result.returncode, 1)
-        status_path = Path(self.env["XDG_STATE_HOME"]) / "omarchy-calendar" / "sync-status.json"
-        status = json.loads(status_path.read_text())
-        self.assertFalse(status["ok"])
-        self.assertIn("remote unavailable", status["error"])
-        self.assertEqual(stat.S_IMODE(status_path.stat().st_mode), 0o600)
+class BackendTests(Isolated):
+    def test_zero_subscriptions_lists_and_calendars_without_khal(self) -> None:
+        (self.bin / "khal").unlink()
+        self.assertEqual(self.protocol({"action": "calendars"}), {"ok": True, "calendars": []})
+        listed = self.protocol({"action": "list", "start": "2030-01-01", "end": "2030-01-01"})
+        self.assertEqual(listed, {"ok": True, "events": []})
 
+    def test_list_preserves_inclusive_dates_and_normalizes_events(self) -> None:
+        item = self.add()["subscription"]
+        response = self.protocol({"action": "list", "requestId": "r", "start": "2030-01-02", "end": "2030-01-02", "calendars": [item["id"]]})
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["events"][0]["start"], "2030-01-02T10:00")
+        self.assertEqual(response["requestId"], "r")
 
-@unittest.skipUnless(shutil.which("khal"), "khal is not installed")
-class Khal014CompatibilityTests(IsolatedEnvironment):
-    def test_local_config_create_and_list_with_khal_014(self) -> None:
-        version = subprocess.run(["khal", "--version"], text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
-        if version != "khal, version 0.14.0":
-            self.skipTest(f"requires khal 0.14.0, found {version}")
-        self.run_setup_local()
-        created = self.run_backend(
-            {"action": "create", "title": "Compatibility", "start": "2030-04-05T10:00", "end": "2030-04-05T10:30", "sync": False}
-        )
-        end_date = self.run_backend(
-            {"action": "create", "title": "Inclusive end", "start": "2030-04-06T10:00", "end": "2030-04-06T10:30", "sync": False}
-        )
-        self.assertTrue(created["ok"], created)
-        self.assertTrue(end_date["ok"], end_date)
-        listed = self.run_backend({"action": "list", "start": "2030-04-05", "end": "2030-04-06"})
-        self.assertEqual(
-            [event["title"] for event in listed["events"]],
-            ["Compatibility", "Inclusive end"],
-        )
+    def test_readonly_actions_are_rejected(self) -> None:
+        for action in ("create", "update", "delete"):
+            with self.subTest(action=action):
+                response = self.protocol({"action": action})
+                self.assertEqual(response["error"]["code"], "read_only")
 
-    def run_setup_local(self) -> None:
-        subprocess.run([str(SETUP), "local"], env=self.env, stdout=subprocess.PIPE, check=True, timeout=10)
+    def test_status_has_metadata_versions_and_sanitized_refresh(self) -> None:
+        item = self.add()["subscription"]
+        subscriptions.write_status({"attempted": True, "ok": False, "at": "2030-01-01T00:00:00+00:00", "subscriptions": [{"id": item["id"], "ok": False, "error": {"code": "fetch_failed", "message": "calendar feed could not be fetched"}}]})
+        response = self.protocol({"action": "status"})
+        self.assertTrue(response["readOnly"])
+        self.assertEqual(response["subscriptionCount"], 1)
+        self.assertEqual(response["subscriptions"], [item])
+        self.assertIn("python-icalendar", response["versions"])
+        self.assertNotIn("https://", json.dumps(response))
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_request_bounds_and_range_validation(self) -> None:
+        response = self.protocol({"action": "list", "start": "2030-01-01", "end": "2032-01-01"})
+        self.assertEqual(response["error"]["code"], "invalid_request")
+        result = subprocess.run([str(WRAPPER), "request"], input=b"{" + b" " * calendar_backend.MAX_REQUEST_BYTES, capture_output=True, env=self.env, check=True)
+        self.assertEqual(json.loads(result.stdout)["error"]["code"], "request_too_large")
