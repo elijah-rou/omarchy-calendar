@@ -150,7 +150,7 @@ BarWidget {
     verticalPadding: 8.75
 
     onPressed: function(b) {
-      if (b === Qt.RightButton) { root.refresh(); root.open() }
+      if (b === Qt.RightButton) { if (root.opened) root.refresh(); else root.open() }
       else if (b === Qt.MiddleButton) { if (root.bar) root.bar.run("omarchy-menu-timezone") }
       else root.togglePanel()
     }

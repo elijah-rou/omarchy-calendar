@@ -50,12 +50,13 @@ Panel {
   property string subscriptionState: "idle"
   property string subscriptionMessage: ""
   property string subscriptionError: ""
-  property string subscriptionRequestText: ""
+  property string pendingSubscriptionPayload: ""
   property var subscriptionProtocolState: ({ finalSeen: false, progressCount: 0 })
   property int subscriptionResponseCharacters: 0
   property int subscriptionResponseLines: 0
   property bool subscriptionTimedOut: false
   property bool subscriptionCancelled: false
+  property bool subscriptionCommitStarted: false
   readonly property bool subscriptionBusy: subscriptionProcess.running || subscriptionState === "running" || subscriptionState === "cancelling"
 
   readonly property string helperPath: Model.localPathForUrl ? Model.localPathForUrl(Qt.resolvedUrl("bin/omarchy-calendar")) : String(Qt.resolvedUrl("bin/omarchy-calendar")).replace(/^file:\/\//, "")
@@ -193,10 +194,11 @@ Panel {
     startSubscription({ action: "list" }, "Loading subscriptions…")
   }
   function clearCredentialFields() {
-    feedUrl.text = ""; feedPassword.text = ""; subscriptionRequestText = ""
+    feedUrl.text = ""; feedUsername.text = ""; feedPassword.text = ""
   }
   function submitSubscription() {
     var checked = Model.validateSubscriptionInput({ name: feedName.text, url: feedUrl.text, username: feedUsername.text, password: feedPassword.text, color: feedColor.text })
+    clearCredentialFields()
     if (!checked.valid) { subscriptionError = checked.error; return }
     startSubscription(checked.value, "Adding subscription…")
   }
@@ -208,12 +210,12 @@ Panel {
     subscriptionRequestId = "subscription-qml-" + subscriptionSequence
     request.requestId = subscriptionRequestId
     subscriptionAction = request.action
-    subscriptionRequestText = JSON.stringify(request)
-    request.url = ""; request.password = ""
+    pendingSubscriptionPayload = JSON.stringify(request)
+    request.url = ""; request.username = ""; request.password = ""
     subscriptionState = "running"; subscriptionMessage = message; subscriptionError = ""
     subscriptionProtocolState = { finalSeen: false, progressCount: 0 }
     subscriptionResponseCharacters = 0; subscriptionResponseLines = 0
-    subscriptionTimedOut = false; subscriptionCancelled = false
+    subscriptionTimedOut = false; subscriptionCancelled = false; subscriptionCommitStarted = false
     subscriptionProcess.command = [helperPath, "subscriptions"]
     subscriptionProcess.running = true
   }
@@ -226,30 +228,39 @@ Panel {
     var parsed = Model.parseSubscriptionProtocolLine(line, subscriptionRequestId, subscriptionProtocolState)
     if (!parsed.valid) { failSubscriptionProtocol(parsed.error); return }
     subscriptionProtocolState = parsed.state
-    if (parsed.kind === "progress") subscriptionMessage = String(parsed.response.stage || "Working…").replace(/^./, function(c) { return c.toUpperCase() }) + "…"
+    if (parsed.kind === "progress") {
+      if (parsed.response.stage === "committing") subscriptionCommitStarted = true
+      subscriptionMessage = String(parsed.response.stage || "Working…").replace(/^./, function(c) { return c.toUpperCase() }) + "…"
+    }
     else {
       var response = parsed.response
       if (response.ok !== true) subscriptionError = String(response.error && response.error.message || "Subscription operation failed").substr(0, 500)
       else {
+        subscriptionCancelled = false
         subscriptionState = "success"; subscriptionMessage = subscriptionAction === "refresh" ? "Subscriptions refreshed" : "Subscription updated"
+        var warnings = response.cleanupWarnings || (response.refresh && response.refresh.cleanupWarnings)
+        if (Array.isArray(warnings) && warnings.length > 0) subscriptionMessage += ". " + String(warnings[0]).substr(0, 300)
         if (Array.isArray(response.subscriptions)) subscriptions = Model.normalizeSubscriptionStatus(response.subscriptions, null)
         if (response.refresh) subscriptions = Model.normalizeSubscriptionStatus(subscriptions, response.refresh)
       }
     }
   }
   function failSubscriptionProtocol(message) {
+    clearCredentialFields()
     subscriptionError = message || "Subscription helper returned invalid data"
     if (subscriptionProcess.running) subscriptionProcess.signal(15)
     subscriptionHardKill.restart()
   }
   function cancelSubscription() {
-    if (!subscriptionBusy || !subscriptionProcess.running) return
+    clearCredentialFields()
+    if (!subscriptionBusy || !subscriptionProcess.running || subscriptionCommitStarted) return
     subscriptionCancelled = true; subscriptionState = "cancelling"; subscriptionMessage = "Cancelling subscription operation…"
     subscriptionProcess.signal(15); subscriptionHardKill.restart()
   }
   function finishSubscription(exitCode) {
-    subscriptionWatchdog.stop(); subscriptionHardKill.stop(); clearCredentialFields()
-    if (subscriptionCancelled) { subscriptionState = "cancelled"; subscriptionMessage = "Subscription operation cancelled" }
+    subscriptionWatchdog.stop(); subscriptionHardKill.stop(); pendingSubscriptionPayload = ""; clearCredentialFields()
+    if (subscriptionState === "success") {}
+    else if (subscriptionCancelled) { subscriptionState = "cancelled"; subscriptionMessage = "Subscription operation cancelled" }
     else if (subscriptionTimedOut) { subscriptionState = "error"; subscriptionError = "Subscription operation timed out" }
     else if (!subscriptionProtocolState.finalSeen) { subscriptionState = "error"; if (subscriptionError === "") subscriptionError = exitCode === 0 ? "Subscription helper ended without a result" : "Subscription helper failed" }
     else if (subscriptionError !== "") subscriptionState = "error"
@@ -283,9 +294,8 @@ Panel {
     stdinEnabled: true
     onStarted: {
       subscriptionWatchdog.restart()
-      var outgoing = root.subscriptionRequestText
-      write(outgoing + "\n")
-      outgoing = ""
+      write(root.pendingSubscriptionPayload + "\n")
+      root.pendingSubscriptionPayload = ""
       root.clearCredentialFields()
     }
     stdout: SplitParser { splitMarker: "\n"; onRead: function(data) { root.acceptSubscriptionLine(data) } }
@@ -454,7 +464,7 @@ Panel {
             width: root.settingsOpen ? Style.space(410) : monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; spacing: Style.space(4)
             Text { width: parent.width; visible: root.subscriptionMessage !== ""; text: root.subscriptionMessage; wrapMode: Text.Wrap; color: root.subscriptionState === "success" ? Color.accent : root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
             Text { width: parent.width; visible: root.subscriptionError !== ""; text: root.subscriptionError; wrapMode: Text.Wrap; color: Color.urgent; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
-            Button { visible: root.subscriptionBusy; text: "Cancel operation"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; onClicked: root.cancelSubscription() }
+            Button { visible: root.subscriptionBusy && !root.subscriptionCommitStarted; text: "Cancel operation"; foreground: root.contentForeground; fontFamily: root.contentFontFamily; onClicked: root.cancelSubscription() }
           }
           Text { visible: !root.settingsOpen && root.backendStatus !== ""; width: monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; text: root.backendStatus; wrapMode: Text.Wrap; color: Color.urgent; font.family: root.contentFontFamily; font.pixelSize: Style.font.caption }
         }

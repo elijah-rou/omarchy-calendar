@@ -7,12 +7,14 @@ import datetime as dt
 import fcntl
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import secrets
 import selectors
 import shutil
 import signal
+import socket
 import ssl
 import subprocess
 import tempfile
@@ -39,6 +41,8 @@ SECRET_TIMEOUT_SECONDS = 10
 MAX_COMMAND_OUTPUT = 64 * 1024
 Progress = Callable[[str, dict[str, Any]], None]
 active_process: subprocess.Popen[bytes] | None = None
+commit_started = False
+commit_completed = False
 
 
 class SubscriptionError(Exception):
@@ -46,6 +50,28 @@ class SubscriptionError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class OperationCancelled(SubscriptionError):
+    def __init__(self) -> None:
+        super().__init__("cancelled", "subscription operation was cancelled")
+
+
+def reset_commit_state() -> None:
+    global commit_started, commit_completed
+    commit_started = False
+    commit_completed = False
+
+
+def begin_commit(progress: Progress, subscription_id: str) -> None:
+    global commit_started
+    progress("committing", {"subscriptionId": subscription_id})
+    commit_started = True
+
+
+def complete_commit() -> None:
+    global commit_completed
+    commit_completed = True
 
 
 def xdg_path(variable: str, fallback: str) -> Path:
@@ -66,6 +92,7 @@ def paths() -> dict[str, Path]:
         "calendars": data / "calendars",
         "status": state / "sync-status.json",
         "lock": state / "operation.lock",
+        "cleanup_pending": state / "cleanup-pending.json",
     }
 
 
@@ -145,7 +172,7 @@ def load_subscriptions() -> list[dict[str, str]]:
             raise SubscriptionError("storage_failed", "subscription metadata is invalid")
         if subscription_id in seen or not isinstance(name, str) or not name:
             raise SubscriptionError("storage_failed", "subscription metadata is invalid")
-        if color is not None and not isinstance(color, str):
+        if color is not None and (not isinstance(color, str) or len(color) != 7 or color[0] != "#" or any(c not in "0123456789abcdefABCDEF" for c in color[1:])):
             raise SubscriptionError("storage_failed", "subscription metadata is invalid")
         item = {"id": subscription_id, "name": name}
         if color is not None:
@@ -282,6 +309,48 @@ def clear_secret(subscription_id: str) -> bool:
         return False
 
 
+def load_cleanup_pending() -> list[str]:
+    try:
+        raw = paths()["cleanup_pending"].read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise SubscriptionError("storage_failed", "pending secret cleanup metadata could not be read") from error
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise SubscriptionError("storage_failed", "pending secret cleanup metadata is invalid") from error
+    if not isinstance(value, list) or len(value) > MAX_SUBSCRIPTIONS:
+        raise SubscriptionError("storage_failed", "pending secret cleanup metadata is invalid")
+    if any(not isinstance(item, str) or len(item) != 32 or any(c not in "0123456789abcdef" for c in item) for item in value):
+        raise SubscriptionError("storage_failed", "pending secret cleanup metadata is invalid")
+    return list(dict.fromkeys(value))
+
+
+def write_cleanup_pending(values: list[str]) -> None:
+    assert len(values) <= MAX_SUBSCRIPTIONS
+    path = paths()["cleanup_pending"]
+    if values:
+        atomic_write(path, (json.dumps(values, separators=(",", ":")) + "\n").encode())
+    else:
+        path.unlink(missing_ok=True)
+
+
+def remember_cleanup(subscription_id: str) -> None:
+    pending = load_cleanup_pending()
+    if subscription_id not in pending:
+        if len(pending) >= MAX_SUBSCRIPTIONS:
+            raise SubscriptionError("storage_failed", "too many pending secret cleanups")
+        pending.append(subscription_id)
+        write_cleanup_pending(pending)
+
+
+def retry_pending_cleanups() -> list[str]:
+    remaining = [subscription_id for subscription_id in load_cleanup_pending() if not clear_secret(subscription_id)]
+    write_cleanup_pending(remaining)
+    return remaining
+
+
 def validated_url(value: str) -> urllib.parse.SplitResult:
     if not isinstance(value, str) or not value or len(value.encode()) > 8192 or value != value.strip():
         raise SubscriptionError("invalid_request", "url must be a bounded HTTPS URL")
@@ -304,7 +373,30 @@ def validated_url(value: str) -> urllib.parse.SplitResult:
         parsed.hostname.encode("idna")
     except UnicodeError as error:
         raise SubscriptionError("invalid_request", "url has an invalid hostname") from error
+    try:
+        literal = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        literal = None
+    if literal is not None and not literal.is_global:
+        raise SubscriptionError("invalid_request", "calendar feed must use a public HTTPS destination")
     return parsed
+
+
+def validate_public_destination(parsed: urllib.parse.SplitResult) -> None:
+    assert parsed.hostname is not None
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as error:
+        raise SubscriptionError("fetch_failed", "calendar feed hostname could not be resolved") from error
+    if not addresses:
+        raise SubscriptionError("fetch_failed", "calendar feed hostname could not be resolved")
+    for address in addresses:
+        try:
+            candidate = ipaddress.ip_address(address[4][0])
+        except ValueError as error:
+            raise SubscriptionError("fetch_failed", "calendar feed resolved to an invalid address") from error
+        if not candidate.is_global:
+            raise SubscriptionError("fetch_failed", "calendar feed resolved to a non-public address")
 
 
 def origin(parsed: urllib.parse.SplitResult) -> tuple[str, str, int]:
@@ -313,8 +405,9 @@ def origin(parsed: urllib.parse.SplitResult) -> tuple[str, str, int]:
 
 
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def __init__(self) -> None:
+    def __init__(self, deadline: float | None = None) -> None:
         self.redirects = 0
+        self.deadline = deadline
 
     def redirect_request(self, req: urllib.request.Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> urllib.request.Request:
         self.redirects += 1
@@ -322,37 +415,65 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
             raise SubscriptionError("fetch_failed", "calendar feed exceeded the redirect limit")
         target = urllib.parse.urljoin(req.full_url, newurl)
         parsed = validated_url(target)
+        validate_public_destination(parsed)
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise SubscriptionError("fetch_failed", "calendar feed fetch timed out")
         headers_copy = dict(req.headers)
         if origin(urllib.parse.urlsplit(req.full_url)) != origin(parsed):
             headers_copy.pop("Authorization", None)
         return urllib.request.Request(target, headers=headers_copy, method="GET")
 
 
+def remaining_fetch_time(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SubscriptionError("fetch_failed", "calendar feed fetch timed out")
+    return remaining
+
+
+def set_response_timeout(response: Any, timeout: float) -> None:
+    # urllib does not expose the socket, but its standard HTTPResponse stack
+    # does. The monotonic checks still bound redirects and each body read.
+    socket_object = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    if socket_object is not None:
+        socket_object.settimeout(timeout)
+
+
 def fetch_feed(credential: dict[str, str]) -> bytes:
     url = credential["url"]
-    validated_url(url)
+    deadline = time.monotonic() + FETCH_TIMEOUT_SECONDS
+    parsed_url = validated_url(url)
+    validate_public_destination(parsed_url)
+    remaining_fetch_time(deadline)
     headers = {"Accept": "text/calendar, application/ics;q=0.9, */*;q=0.1", "User-Agent": "omarchy-calendar/1"}
     username = credential.get("username")
     if username is not None:
         token = base64.b64encode(f"{username}:{credential['password']}".encode()).decode("ascii")
         headers["Authorization"] = f"Basic {token}"
     request = urllib.request.Request(url, headers=headers, method="GET")
-    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl.create_default_context()), SafeRedirectHandler())
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl.create_default_context()), SafeRedirectHandler(deadline))
     try:
-        with opener.open(request, timeout=FETCH_TIMEOUT_SECONDS) as response:
+        with opener.open(request, timeout=remaining_fetch_time(deadline)) as response:
             if response.geturl() and urllib.parse.urlsplit(response.geturl()).scheme != "https":
                 raise SubscriptionError("fetch_failed", "calendar feed redirected to an unsafe URL")
             length = response.headers.get("Content-Length")
             if length is not None and int(length) > MAX_FEED_BYTES:
                 raise SubscriptionError("feed_too_large", "calendar feed exceeds 16 MiB")
-            content = response.read(MAX_FEED_BYTES + 1)
+            content = bytearray()
+            while len(content) <= MAX_FEED_BYTES:
+                remaining = remaining_fetch_time(deadline)
+                set_response_timeout(response, remaining)
+                chunk = response.read(min(64 * 1024, MAX_FEED_BYTES + 1 - len(content)))
+                if not chunk:
+                    break
+                content.extend(chunk)
     except SubscriptionError:
         raise
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ssl.SSLError, http.client.HTTPException, OSError, ValueError) as error:
         raise SubscriptionError("fetch_failed", "calendar feed could not be fetched") from error
     if len(content) > MAX_FEED_BYTES:
         raise SubscriptionError("feed_too_large", "calendar feed exceeds 16 MiB")
-    return content
+    return bytes(content)
 
 
 def validate_icalendar(content: bytes) -> int:
@@ -485,6 +606,8 @@ def add_subscription(request: dict[str, Any], progress: Progress) -> dict[str, A
     validate_request_keys(request, allowed, {"action", "name", "url"})
     name = bounded_text(request, "name", 256, required=True)
     color = bounded_text(request, "color", 64)
+    if color is not None and (len(color) != 7 or color[0] != "#" or any(c not in "0123456789abcdefABCDEF" for c in color[1:])):
+        raise SubscriptionError("invalid_request", "color must use #RRGGBB")
     url = bounded_text(request, "url", 8192, required=True)
     username = bounded_text(request, "username", 1024)
     password = bounded_text(request, "password", 16 * 1024, allow_controls=True)
@@ -495,6 +618,13 @@ def add_subscription(request: dict[str, Any], progress: Progress) -> dict[str, A
     assert name is not None and url is not None
     validated_url(url)
     lock = acquire_lock()
+    try:
+        cleanup_warnings = retry_pending_cleanups()
+        if len(cleanup_warnings) >= MAX_SUBSCRIPTIONS:
+            raise SubscriptionError("cleanup_pending", "pending secret cleanups must complete before adding another subscription")
+    except BaseException:
+        lock.close()
+        raise
     subscription_id = secrets.token_hex(16)
     item = {"id": subscription_id, "name": name}
     if color is not None:
@@ -523,24 +653,35 @@ def add_subscription(request: dict[str, Any], progress: Progress) -> dict[str, A
         with tempfile.TemporaryDirectory(prefix=".add-", dir=paths()["data"]) as temporary:
             candidate = import_candidate(item, content, Path(temporary))
             validate_total_data(candidate, subscription_id)
+            begin_commit(progress, subscription_id)
             replace_directory(candidate, destination)
         updated = [*subscriptions, item]
         try:
             atomic_write(paths()["metadata"], metadata_bytes(updated))
             atomic_write(paths()["khal_config"], khal_config(updated))
             committed = True
+            complete_commit()
         except BaseException:
             shutil.rmtree(paths()["calendars"] / subscription_id, ignore_errors=True)
             atomic_write(paths()["metadata"], metadata_bytes(subscriptions))
             atomic_write(paths()["khal_config"], khal_config(subscriptions))
             raise
-        return {"subscription": item, "events": count}
+        result: dict[str, Any] = {"subscription": item, "events": count}
+        if cleanup_warnings:
+            result["cleanupWarnings"] = ["Some previously failed secret cleanups still need attention"]
+        return result
+    except (SubscriptionError, OSError) as error:
+        shutil.rmtree(destination, ignore_errors=True)
+        cleanup_failed = stored and not committed and not clear_secret(subscription_id)
+        if cleanup_failed:
+            remember_cleanup(subscription_id)
+            message = (error.message if isinstance(error, SubscriptionError) else "subscription storage failed")
+            raise SubscriptionError("cleanup_pending", f"{message}; secret cleanup will be retried") from error
+        if isinstance(error, SubscriptionError):
+            raise
+        raise SubscriptionError("storage_failed", "subscription storage failed") from error
     finally:
         lock.close()
-        if not committed:
-            shutil.rmtree(destination, ignore_errors=True)
-        if stored and not committed:
-            clear_secret(subscription_id)
 
 
 def remove_subscription(request: dict[str, Any], progress: Progress) -> dict[str, Any]:
@@ -549,6 +690,11 @@ def remove_subscription(request: dict[str, Any], progress: Progress) -> dict[str
     assert subscription_id is not None
     lock = acquire_lock()
     try:
+        cleanup_warnings = retry_pending_cleanups()
+    except BaseException:
+        lock.close()
+        raise
+    try:
         subscriptions = load_subscriptions()
         matching = [item for item in subscriptions if item["id"] == subscription_id]
         if not matching:
@@ -556,21 +702,27 @@ def remove_subscription(request: dict[str, Any], progress: Progress) -> dict[str
         updated = [item for item in subscriptions if item["id"] != subscription_id]
         destination = paths()["calendars"] / subscription_id
         backup = destination.with_name(f".{subscription_id}-removed-{secrets.token_hex(8)}")
+        begin_commit(progress, subscription_id)
         try:
             if destination.exists():
                 os.replace(destination, backup)
             atomic_write(paths()["metadata"], metadata_bytes(updated))
             atomic_write(paths()["khal_config"], khal_config(updated))
+            progress("clearing", {"subscriptionId": subscription_id})
+            if not clear_secret(subscription_id):
+                raise SubscriptionError("credential_cleanup_failed", "subscription credential could not be removed")
         except BaseException:
-            if backup.exists():
-                os.replace(backup, destination)
             atomic_write(paths()["metadata"], metadata_bytes(subscriptions))
             atomic_write(paths()["khal_config"], khal_config(subscriptions))
+            if backup.exists():
+                os.replace(backup, destination)
             raise
         shutil.rmtree(backup, ignore_errors=True)
-        progress("clearing", {"subscriptionId": subscription_id})
-        cleanup = clear_secret(subscription_id)
-        return {"removed": matching[0], "cleanupComplete": cleanup}
+        complete_commit()
+        result: dict[str, Any] = {"removed": matching[0], "cleanupComplete": True}
+        if cleanup_warnings:
+            result["cleanupWarnings"] = ["Some previously failed secret cleanups still need attention"]
+        return result
     finally:
         lock.close()
 
@@ -578,6 +730,7 @@ def remove_subscription(request: dict[str, Any], progress: Progress) -> dict[str
 def refresh_subscriptions(progress: Progress = lambda _stage, _details: None) -> dict[str, Any]:
     lock = acquire_lock()
     try:
+        cleanup_warnings = retry_pending_cleanups()
         subscriptions = load_subscriptions()
         results: list[dict[str, Any]] = []
         for item in subscriptions:
@@ -587,7 +740,14 @@ def refresh_subscriptions(progress: Progress = lambda _stage, _details: None) ->
                 results.append({"id": item["id"], "ok": True, "events": count})
             except SubscriptionError as error:
                 results.append({"id": item["id"], "ok": False, "error": {"code": error.code, "message": error.message}})
+            except (OSError, urllib.error.URLError, http.client.HTTPException, ssl.SSLError):
+                # Filesystem, process-spawn, TLS, and local networking failures
+                # are runtime feed failures. Logic errors remain intentionally
+                # outside this boundary and fail the operation loudly.
+                results.append({"id": item["id"], "ok": False, "error": {"code": "refresh_failed", "message": "calendar feed could not be refreshed"}})
         status = sanitized_status(results)
+        if cleanup_warnings:
+            status["cleanupWarnings"] = ["Some secret cleanups still need attention"]
         write_status(status)
         return status
     finally:
@@ -617,6 +777,7 @@ def bounded_text(request: dict[str, Any], key: str, maximum: int, *, required: b
 
 
 def dispatch(request: dict[str, Any], progress: Progress) -> dict[str, Any]:
+    reset_commit_state()
     request_id = request.get("requestId")
     if not isinstance(request_id, str) or not request_id or len(request_id.encode()) > 128:
         raise SubscriptionError("invalid_request", "requestId must be a nonempty string of at most 128 bytes")
@@ -643,10 +804,14 @@ def encode_line(value: dict[str, Any]) -> bytes:
     return encoded + b"\n"
 
 
-def handle_termination(signum: int, _frame: Any) -> None:
+def handle_termination(_signum: int, _frame: Any) -> None:
+    if commit_started:
+        # Once committing is announced, finish rollback or post-commit cleanup
+        # and let the final protocol result describe the durable outcome.
+        return
     if active_process is not None:
         terminate_process_group(active_process)
-    raise SystemExit(128 + signum)
+    raise OperationCancelled()
 
 
 def subscriptions_main() -> int:

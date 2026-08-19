@@ -83,6 +83,13 @@ def normalize_event(row: dict[str, Any]) -> dict[str, Any]:
         start = start[:10] + "T" + start[11:]
     if isinstance(end, str) and not all_day and len(end) >= 16:
         end = end[:10] + "T" + end[11:]
+    if all_day and isinstance(end, str):
+        try:
+            # khal 0.14 reports all-day DTEND as an inclusive display date;
+            # the backend and QML use RFC 5545's exclusive-end contract.
+            end = (dt.date.fromisoformat(end[:10]) + dt.timedelta(days=1)).isoformat()
+        except ValueError as error:
+            raise ProtocolError("command_failed", "khal returned an invalid event") from error
     event = {
         "uid": row.get("uid", ""), "title": row.get("title", ""), "start": start[:10] if all_day and isinstance(start, str) else start,
         "end": end[:10] if all_day and isinstance(end, str) else end, "location": row.get("location", ""),
@@ -120,7 +127,7 @@ def parse_khal_rows(output: bytes) -> list[dict[str, Any]]:
 
 
 def request_list(request: dict[str, Any]) -> dict[str, Any]:
-    validate_keys(request, {"action", "requestId", "start", "end", "calendars"}, {"action", "start", "end"})
+    validate_keys(request, {"action", "requestId", "start", "end", "calendars"}, {"action", "requestId", "start", "end"})
     start_text = bounded_string(request, "start", 10, required=True)
     end_text = bounded_string(request, "end", 10, required=True)
     assert start_text is not None and end_text is not None
@@ -140,7 +147,7 @@ def request_list(request: dict[str, Any]) -> dict[str, Any]:
     khal = shutil.which("khal")
     if khal is None:
         raise ProtocolError("dependency_missing", "khal is not installed")
-    arguments = [khal, "-c", str(paths()["khal_config"]), "--no-color", "list", "--once", *json_options()]
+    arguments = [khal, "-c", str(paths()["khal_config"]), "--no-color", "list", *json_options()]
     for calendar in requested:
         arguments.extend(("--include-calendar", calendar))
     arguments.extend((start_text, end_text))
@@ -149,14 +156,18 @@ def request_list(request: dict[str, Any]) -> dict[str, Any]:
     except SubscriptionError as error:
         raise ProtocolError(error.code, error.message) from error
     events = parse_khal_rows(output)
-    calendar_names = {item["id"]: item["name"] for item in subscriptions}
+    calendar_metadata = {item["id"]: item for item in subscriptions}
     for event in events:
-        event["calendarName"] = calendar_names.get(event["calendarId"], event["calendarId"])
+        metadata = calendar_metadata.get(event["calendarId"])
+        if metadata is not None:
+            event["calendarName"] = metadata["name"]
+            if "color" in metadata:
+                event["color"] = metadata["color"]
     return {"ok": True, "events": events}
 
 
 def request_calendars(request: dict[str, Any]) -> dict[str, Any]:
-    validate_keys(request, {"action", "requestId"}, {"action"})
+    validate_keys(request, {"action", "requestId"}, {"action", "requestId"})
     return {"ok": True, "calendars": [{"id": item["id"], "name": item["name"], "writable": False, **({"color": item["color"]} if "color" in item else {})} for item in load_subscriptions()]}
 
 
@@ -183,7 +194,7 @@ def last_refresh() -> dict[str, Any] | None:
 
 
 def request_status(request: dict[str, Any]) -> dict[str, Any]:
-    validate_keys(request, {"action", "requestId"}, {"action"})
+    validate_keys(request, {"action", "requestId"}, {"action", "requestId"})
     subscriptions = load_subscriptions()
     try:
         icalendar_version = importlib.metadata.version("icalendar")
@@ -199,8 +210,8 @@ def request_status(request: dict[str, Any]) -> dict[str, Any]:
 
 def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     request_id = request.get("requestId")
-    if request_id is not None and (not isinstance(request_id, str) or len(request_id.encode()) > 128):
-        raise ProtocolError("invalid_request", "requestId must be a string of at most 128 bytes")
+    if not isinstance(request_id, str) or not request_id or len(request_id.encode()) > 128:
+        raise ProtocolError("invalid_request", "requestId must be a nonempty string of at most 128 bytes")
     action = request.get("action")
     handlers = {"list": request_list, "calendars": request_calendars, "status": request_status}
     if action in {"create", "update", "delete"}:
@@ -208,8 +219,7 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(action, str) or action not in handlers:
         raise ProtocolError("unknown_action", "action must be list, calendars, or status")
     response = handlers[action](request)
-    if request_id is not None:
-        response["requestId"] = request_id
+    response["requestId"] = request_id
     return response
 
 

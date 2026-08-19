@@ -31,7 +31,8 @@ configuration, status, logs, or errors. The private mode-`0600`
 `subscriptions.json` contains only IDs, names, and colors. Secret Service items
 use deterministic attributes namespaced to the installation's XDG roots.
 
-Requests are at most 64 KiB and include an optional `requestId`. Output consists
+Requests are at most 64 KiB and require a nonempty `requestId` of at most 128
+bytes. Output consists
 of bounded progress objects followed by exactly one final result:
 
 ```json
@@ -42,23 +43,41 @@ of bounded progress objects followed by exactly one final result:
 {"action":"refresh","requestId":"refresh-1"}
 ```
 
-Add fetches, parses, and imports a candidate before committing it. Remove updates
-metadata and calendar data before clearing only that subscription's Secret
-Service item. Refresh handles feeds independently and preserves each last-good
-calendar if fetching, validation, or import fails.
+Add fetches, parses, and imports a candidate before committing it. Remove stages
+metadata and calendar data, then clears only that subscription's Secret Service
+item; a clear failure rolls the staged removal back. Failed-add clear failures
+are recorded as bounded cleanup-pending IDs and retried by later mutations or
+refreshes. Add and remove emit `committing` before their durable boundary.
+Cancellation before that stage rolls back; cancellation after it is deferred so
+the backend can return the final durable success or warning. Refresh handles
+feeds independently and preserves each last-good calendar if fetching,
+validation, import, or expected local OS work fails.
 
-Fetching uses Python's standard-library HTTPS client with explicit timeouts and
-redirect, response, event, and imported-data limits. HTTP URLs, userinfo,
-fragments, invalid hosts and ports, and HTTPS downgrade redirects are rejected.
-Basic Authorization is removed on cross-origin redirects. Accepted content must
+Fetching uses Python's standard-library HTTPS client with one monotonic deadline
+across DNS, redirects, response headers, and body reads, plus redirect, response,
+event, and imported-data limits. HTTP URLs, userinfo, fragments, invalid hosts
+and ports, HTTPS downgrade redirects, and destinations resolving to loopback,
+link-local, private, reserved, or multicast addresses are rejected. LAN feeds
+are intentionally unsupported in v1. Basic Authorization is removed on
+cross-origin redirects. DNS is validated before each request, but the standard
+client does not pin the validated address, so DNS rebinding between validation
+and connection remains a residual risk. Accepted content must
 parse with `python-icalendar`; `khal import --batch --include-calendar` creates
 the per-UID vdir data used by the widget.
 
-Run the same refresh path manually or from the checked-in systemd user timer:
+Run the same refresh path manually, or install/update and enable the checked-in
+systemd user units:
 
 ```sh
 omarchy-calendar sync
+omarchy-calendar install-timer
 ```
+
+`install-timer` disables the old timer, stops any running legacy sync service,
+installs the current command and its bounded backend runtime, replaces both user
+units, runs `daemon-reload`, enables and starts the timer, and removes the obsolete
+`~/.local/bin/omarchy-calendar-sync` helper from vdirsyncer-era installations.
+The service invokes the current `omarchy-calendar sync` command.
 
 ## Backend protocol
 
@@ -67,12 +86,14 @@ newline. The read-only backend supports `list`, `calendars`, and `status`.
 Create, update, and delete requests return a `read_only` error.
 
 ```json
-{"action":"list","start":"2026-07-01","end":"2026-08-01","calendars":["subscription-id"]}
-{"action":"calendars"}
-{"action":"status"}
+{"action":"list","requestId":"list-1","start":"2026-07-01","end":"2026-08-01","calendars":["subscription-id"]}
+{"action":"calendars","requestId":"calendars-1"}
+{"action":"status","requestId":"status-1"}
 ```
 
-List dates are inclusive, including a same-day range. Requests are limited to
+Every backend request requires the same bounded nonempty `requestId`, which is
+echoed in its response. List dates are inclusive, including a same-day range.
+Requests are limited to
 64 KiB, responses to 1 MiB, ranges to 366 days, and results to 256 events. With
 zero subscriptions, `list` and `calendars` return empty results without invoking
 khal.
@@ -85,7 +106,7 @@ versions. It does not access Secret Service or a remote feed.
 Generated paths use the `omarchy-calendar` namespace:
 
 - metadata and khal config: `$XDG_CONFIG_HOME/omarchy-calendar`
-- read-only vdir data: `$XDG_DATA_HOME/omarchy-calendar/calendars`
+- read-only vdir data and installed timer runtime: `$XDG_DATA_HOME/omarchy-calendar`
 - refresh status and lock: `$XDG_STATE_HOME/omarchy-calendar`
 
 Directories are mode `0700`; generated files are mode `0600`.

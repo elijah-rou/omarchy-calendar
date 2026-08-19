@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import signal
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
+if not (root / "backend" / "subscriptions.py").is_file():
+    root = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")).expanduser() / "omarchy-calendar" / "runtime"
 sys.path.insert(0, str(root))
 
 from backend import calendar_backend
@@ -21,7 +27,67 @@ from backend.subscriptions import (
 
 
 def usage() -> None:
-    print("Usage: omarchy-calendar <request|subscriptions|sync>")
+    print("Usage: omarchy-calendar <request|subscriptions|sync|install-timer>")
+
+
+def install_timer() -> int:
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        print("omarchy-calendar: systemctl is not installed", file=sys.stderr)
+        return 1
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")).expanduser()
+    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")).expanduser()
+    unit_directory = config_home / "systemd" / "user"
+    unit_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        # Quiesce both the legacy timer and any vdirsyncer-era service before
+        # replacing their definitions. Missing or inactive units are benign.
+        subprocess.run([systemctl, "--user", "disable", "--now", "omarchy-calendar-sync.timer"], check=False, timeout=30)
+        subprocess.run([systemctl, "--user", "stop", "omarchy-calendar-sync.service"], check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"omarchy-calendar: could not stop legacy synchronization: {error}", file=sys.stderr)
+        return 1
+    local_bin = Path.home() / ".local" / "bin"
+    runtime_root = data_home / "omarchy-calendar" / "runtime"
+    runtime_backend = runtime_root / "backend"
+    runtime_units = runtime_root / "systemd"
+    local_bin.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime_backend.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime_units.mkdir(mode=0o700, parents=True, exist_ok=True)
+    files = [
+        (Path(__file__).resolve(), local_bin / "omarchy-calendar", 0o755),
+        (root / "backend" / "calendar_backend.py", runtime_backend / "calendar_backend.py", 0o600),
+        (root / "backend" / "subscriptions.py", runtime_backend / "subscriptions.py", 0o600),
+        (root / "systemd" / "omarchy-calendar-sync.service", runtime_units / "omarchy-calendar-sync.service", 0o600),
+        (root / "systemd" / "omarchy-calendar-sync.timer", runtime_units / "omarchy-calendar-sync.timer", 0o600),
+        (root / "systemd" / "omarchy-calendar-sync.service", unit_directory / "omarchy-calendar-sync.service", 0o644),
+        (root / "systemd" / "omarchy-calendar-sync.timer", unit_directory / "omarchy-calendar-sync.timer", 0o644),
+    ]
+    for source, destination, mode in files:
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}-", dir=destination.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(source.read_bytes())
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, destination)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+    obsolete = local_bin / "omarchy-calendar-sync"
+    obsolete.unlink(missing_ok=True)
+    commands = (
+        [systemctl, "--user", "daemon-reload"],
+        [systemctl, "--user", "enable", "--now", "omarchy-calendar-sync.timer"],
+    )
+    try:
+        for command in commands:
+            subprocess.run(command, check=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"omarchy-calendar: timer installation failed: {error}", file=sys.stderr)
+        return 1
+    print("Omarchy Calendar synchronization timer installed")
+    return 0
 
 
 def main() -> int:
@@ -35,6 +101,12 @@ def main() -> int:
         return calendar_backend.main()
     if command == "subscriptions":
         return subscriptions_main()
+    if command == "install-timer":
+        try:
+            return install_timer()
+        except OSError as error:
+            print(f"omarchy-calendar: timer installation failed: {error}", file=sys.stderr)
+            return 1
     if command == "sync":
         try:
             result = refresh_subscriptions()
