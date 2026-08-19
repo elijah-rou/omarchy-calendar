@@ -426,8 +426,16 @@ Panel {
                 Rectangle { width: Style.space(4); height: parent.height; radius: parent.radius; color: modelData.color }
                 Row {
                   id: agendaRow; anchors.left: parent.left; anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; anchors.leftMargin: Style.space(12); anchors.rightMargin: Style.space(8); spacing: Style.space(8)
-                  Text { width: Style.space(92); text: modelData.startKey + "\n" + root.eventTime(modelData); color: Qt.darker(root.contentForeground, 1.35); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption }
-                  Text { width: parent.width - Style.space(100); text: modelData.title + "\n" + modelData.calendarName; elide: Text.ElideRight; color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.body }
+                  Column {
+                    width: Style.space(92); spacing: Style.space(2)
+                    Text { width: parent.width; text: modelData.startKey; elide: Text.ElideRight; maximumLineCount: 1; color: Qt.darker(root.contentForeground, 1.35); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption }
+                    Text { width: parent.width; text: root.eventTime(modelData); elide: Text.ElideRight; maximumLineCount: 1; color: Qt.darker(root.contentForeground, 1.35); font.family: root.contentFontFamily; font.pixelSize: Style.font.caption }
+                  }
+                  Column {
+                    width: parent.width - Style.space(100); spacing: Style.space(2)
+                    Text { width: parent.width; text: modelData.title; wrapMode: Text.NoWrap; elide: Text.ElideRight; maximumLineCount: 1; color: root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.body }
+                    Text { width: parent.width; text: modelData.calendarName; wrapMode: Text.NoWrap; elide: Text.ElideRight; maximumLineCount: 1; color: Qt.darker(root.contentForeground, 1.35); font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
+                  }
                 }
               }
             }
@@ -467,7 +475,7 @@ Panel {
           }
 
           Column {
-            visible: root.subscriptionBusy || root.subscriptionMessage !== "" || root.subscriptionError !== ""
+            visible: root.settingsOpen && (root.subscriptionBusy || root.subscriptionMessage !== "" || root.subscriptionError !== "")
             width: root.settingsOpen ? Style.space(410) : monthGrid.width; anchors.horizontalCenter: parent.horizontalCenter; spacing: Style.space(4)
             Text { width: parent.width; visible: root.subscriptionMessage !== ""; text: root.subscriptionMessage; wrapMode: Text.Wrap; color: root.subscriptionState === "success" ? Color.accent : root.contentForeground; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
             Text { width: parent.width; visible: root.subscriptionError !== ""; text: root.subscriptionError; wrapMode: Text.Wrap; color: Color.urgent; font.family: root.contentFontFamily; font.pixelSize: Style.font.bodySmall }
