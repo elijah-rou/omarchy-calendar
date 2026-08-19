@@ -767,8 +767,15 @@ class GoogleAuthorizationDetector:
             return "Create a Desktop OAuth client, then import its downloaded JSON file"
         if "invalid_client" in diagnostic or "oauth client was not found" in diagnostic:
             return "Google rejected this OAuth client; recreate a Desktop OAuth client and import its JSON file"
-        if "invalid_grant" in diagnostic or "invalid token" in diagnostic:
+        if "invalid_grant" in diagnostic or "invalid token" in diagnostic or "unauthorized" in diagnostic:
             return "Google rejected the authorization token; connect again and approve access in the browser"
+        if "unknown error occurred: forbidden" in diagnostic or "403 forbidden" in diagnostic:
+            return "Google Calendar denied synchronization; enable Calendar API in the OAuth project and reconnect"
+        if "unknown error occurred: not found" in diagnostic or "404 not found" in diagnostic:
+            return "Google Calendar was not found; open calendar.google.com once, confirm Calendar API is enabled, and reconnect"
+        detail = re.search(r"error: unknown error occurred: ([a-z][a-z0-9 ._-]{0,100})", diagnostic)
+        if detail is not None:
+            return f"Google Calendar setup failed: {detail.group(1).strip()}"
         return ""
 
     def clear(self) -> None:
@@ -927,14 +934,16 @@ def setup_remote(
                     monitor=candidate_monitor,
                     error_message=(authorization_detector.failure_message if request["provider"] == "google" else None),
                 )
+                emit_progress("syncing", "Performing initial calendar sync", replaces_existing)
+                run_process(
+                    ["vdirsyncer", "-c", str(candidate_config), "sync"],
+                    COMMAND_TIMEOUT_SECONDS,
+                    output_handler=(authorization_detector.feed if request["provider"] == "google" else None),
+                    monitor=candidate_monitor,
+                    error_message=(authorization_detector.failure_message if request["provider"] == "google" else None),
+                )
             finally:
                 authorization_detector.clear()
-            emit_progress("syncing", "Performing initial calendar sync", replaces_existing)
-            run_process(
-                ["vdirsyncer", "-c", str(candidate_config), "sync"],
-                COMMAND_TIMEOUT_SECONDS,
-                monitor=candidate_monitor,
-            )
             validate_candidate_bounds(candidate_root)
             if candidate_token is not None and not candidate_token.is_file():
                 raise SetupError("oauth_failed", "Google authorization did not produce an OAuth token")

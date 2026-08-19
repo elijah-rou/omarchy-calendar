@@ -181,14 +181,15 @@ if path_match:
                 stream.truncate(256 * 1024 * 1024 + 1)
         else:
             candidate.write_text("candidate")
+failure = os.environ.get("GOOGLE_FAILURE_" + phase.upper()) or os.environ.get("GOOGLE_FAILURE")
+if failure:
+    print(failure, flush=True)
+    raise SystemExit(7)
 token_match = re.search(r'^token_file = (".*")$', content, re.MULTILINE)
 if token_match and phase == "discover":
     if os.environ.get("EMIT_GOOGLE_URL") == "1":
         print("diagnostic that must not be forwarded", flush=True)
         print("https://accounts.google.com/o/oauth2/auth?client_id=desktop&scope=calendar", flush=True)
-    if os.environ.get("GOOGLE_FAILURE"):
-        print(os.environ["GOOGLE_FAILURE"], flush=True)
-        raise SystemExit(7)
     token = pathlib.Path(json.loads(token_match.group(1)))
     token.write_text(json.dumps({"token": config.parent.name}))
 '''
@@ -859,6 +860,23 @@ class WidgetSetupRequestTests(IsolatedEnvironment):
             "Enable Google Calendar API in this OAuth client's Google Cloud project, then connect again",
         )
         self.assertNotIn(b"Google Calendar API has not been used", result.stdout)
+        self.assertNotIn(b"oauth-secret", result.stdout)
+
+    def test_google_sync_failure_reports_safe_dav_guidance(self) -> None:
+        self.env["GOOGLE_FAILURE_SYNC"] = "error: Unknown error occurred: Not Found"
+        result, lines = self.run_setup_request({
+            "requestId": "google-sync-not-found",
+            "provider": "google",
+            "clientId": "desktop.apps.googleusercontent.com",
+            "secret": "oauth-secret",
+        })
+        response = lines[-1]
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error"]["message"],
+            "Google Calendar was not found; open calendar.google.com once, confirm Calendar API is enabled, and reconnect",
+        )
+        self.assertNotIn(b"Unknown error occurred", result.stdout)
         self.assertNotIn(b"oauth-secret", result.stdout)
 
     def test_oversize_candidate_fails_before_commit_and_clears_credential(self) -> None:
